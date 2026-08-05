@@ -1,0 +1,183 @@
+// Take a look at the license at the top of the repository in the LICENSE file.
+
+#[cfg(feature = "v1_28")]
+use std::{future::Future, pin::Pin};
+
+use glib::{prelude::*, signal::SignalHandlerId, translate::*};
+
+use crate::{ffi, ClockTime, Object, ObjectFlags};
+
+pub trait GstObjectExtManual: IsA<Object> + 'static {
+    #[doc(alias = "deep-notify")]
+    fn connect_deep_notify<
+        F: Fn(&Self, &crate::Object, &glib::ParamSpec) + Send + Sync + 'static,
+    >(
+        &self,
+        name: Option<&str>,
+        f: F,
+    ) -> SignalHandlerId {
+        let signal_name = if let Some(name) = name {
+            format!("deep-notify::{name}")
+        } else {
+            "deep-notify".into()
+        };
+
+        let obj: Borrowed<glib::Object> =
+            unsafe { from_glib_borrow(self.as_ptr() as *mut glib::gobject_ffi::GObject) };
+
+        obj.connect(signal_name.as_str(), false, move |values| {
+            // It would be nice to display the actual signal name in the panic messages below,
+            // but that would require to copy `signal_name` so as to move it into the closure
+            // which seems too much for the messages of development errors
+            let obj: Self = unsafe {
+                values[0]
+                    .get::<crate::Object>()
+                    .unwrap_or_else(|err| panic!("Object signal \"deep-notify\": values[0]: {err}"))
+                    .unsafe_cast()
+            };
+            let prop_obj: crate::Object = values[1]
+                .get()
+                .unwrap_or_else(|err| panic!("Object signal \"deep-notify\": values[1]: {err}"));
+
+            let pspec = unsafe {
+                let pspec = glib::gobject_ffi::g_value_get_param(values[2].to_glib_none().0);
+                from_glib_none(pspec)
+            };
+
+            f(&obj, &prop_obj, &pspec);
+
+            None
+        })
+    }
+
+    fn set_object_flags(&self, flags: ObjectFlags) {
+        unsafe {
+            let ptr: *mut ffi::GstObject = self.as_ptr() as *mut _;
+            let _guard = self.as_ref().object_lock();
+            (*ptr).flags |= flags.into_glib();
+        }
+    }
+
+    fn unset_object_flags(&self, flags: ObjectFlags) {
+        unsafe {
+            let ptr: *mut ffi::GstObject = self.as_ptr() as *mut _;
+            let _guard = self.as_ref().object_lock();
+            (*ptr).flags &= !flags.into_glib();
+        }
+    }
+
+    #[doc(alias = "get_object_flags")]
+    fn object_flags(&self) -> ObjectFlags {
+        unsafe {
+            let ptr: *mut ffi::GstObject = self.as_ptr() as *mut _;
+            let _guard = self.as_ref().object_lock();
+            from_glib((*ptr).flags)
+        }
+    }
+
+    #[doc(alias = "get_g_value_array")]
+    #[doc(alias = "gst_object_get_g_value_array")]
+    fn g_value_array(
+        &self,
+        property_name: &str,
+        timestamp: ClockTime,
+        interval: ClockTime,
+        values: &mut [glib::Value],
+    ) -> Result<(), glib::error::BoolError> {
+        let n_values = values.len() as u32;
+        unsafe {
+            glib::result_from_gboolean!(
+                ffi::gst_object_get_g_value_array(
+                    self.as_ref().to_glib_none().0,
+                    property_name.to_glib_none().0,
+                    timestamp.into_glib(),
+                    interval.into_glib(),
+                    n_values,
+                    values.as_mut_ptr() as *mut glib::gobject_ffi::GValue,
+                ),
+                "Failed to get value array"
+            )
+        }
+    }
+
+    #[inline]
+    fn object_lock(&self) -> crate::utils::ObjectLockGuard<'_, Self> {
+        crate::utils::ObjectLockGuard::acquire(self)
+    }
+
+    #[cfg(feature = "v1_28")]
+    #[doc(alias = "gst_object_call_async")]
+    fn call_async<F>(&self, func: F)
+    where
+        F: FnOnce(&Self) + Send + 'static,
+    {
+        let user_data: Box<F> = Box::new(func);
+
+        unsafe extern "C" fn trampoline<O: IsA<Object>, F: FnOnce(&O) + Send + 'static>(
+            object: *mut ffi::GstObject,
+            user_data: glib::ffi::gpointer,
+        ) {
+            let callback: Box<F> = Box::from_raw(user_data as *mut _);
+            callback(Object::from_glib_borrow(object).unsafe_cast_ref());
+        }
+
+        unsafe {
+            ffi::gst_object_call_async(
+                self.as_ref().to_glib_none().0,
+                Some(trampoline::<Self, F>),
+                Box::into_raw(user_data) as *mut _,
+            );
+        }
+    }
+
+    #[cfg(feature = "v1_28")]
+    fn call_async_future<F, T>(&self, func: F) -> Pin<Box<dyn Future<Output = T> + Send + 'static>>
+    where
+        F: FnOnce(&Self) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        use futures_channel::oneshot;
+
+        let (sender, receiver) = oneshot::channel();
+
+        self.call_async(move |object| {
+            let _ = sender.send(func(object));
+        });
+
+        Box::pin(async move { receiver.await.expect("sender dropped") })
+    }
+}
+
+impl<O: IsA<Object>> GstObjectExtManual for O {}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::prelude::*;
+
+    #[test]
+    fn test_deep_notify() {
+        crate::init().unwrap();
+
+        let bin = crate::Bin::new();
+        let identity = crate::ElementFactory::make("identity")
+            .name("id")
+            .build()
+            .unwrap();
+        bin.add(&identity).unwrap();
+
+        let notify = Arc::new(Mutex::new(None));
+        let notify_clone = notify.clone();
+        bin.connect_deep_notify(None, move |_, id, prop| {
+            *notify_clone.lock().unwrap() = Some((id.clone(), prop.name()));
+        });
+
+        identity.set_property("silent", false);
+        assert_eq!(
+            *notify.lock().unwrap(),
+            Some((identity.upcast::<crate::Object>(), "silent"))
+        );
+    }
+}

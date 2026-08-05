@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.example.TranscriptionMvp</id>
+  <name>Transcription MVP</name>
+  <summary>Play local audio while following a waveform</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.github.example">
+    <name>Transcription MVP contributors</name>
+  </developer>
+  <url type="homepage">https://github.com/example/TranscriptionMvp</url>
+  <description>
+    <p>
+      Transcription MVP is a deliberately small audio player for transcription work.
+      It opens local audio, provides standard playback and seeking controls, and
+      generates a waveform without blocking the interface.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.example.TranscriptionMvp.desktop</launchable>
+  <provides>
+    <binary>transcription-mvp</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-08-05">
+      <description>
+        <p>Initial minimal playback, seeking, and waveform release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

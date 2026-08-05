@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Transcription MVP
+Comment=Play audio and view its waveform
+Exec=transcription-mvp
+Icon=io.github.example.TranscriptionMvp
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=audio;transcription;waveform;
+StartupNotify=true

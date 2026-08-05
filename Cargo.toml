@@ -1,0 +1,19 @@
+[package]
+name = "transcription-mvp"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "A minimal desktop audio player with a waveform for transcription work"
+
+[dependencies]
+anyhow = "1.0"
+gstreamer = "0.24"
+gstreamer-app = "0.24"
+gtk = { package = "gtk4", version = "0.10", features = ["v4_10"] }
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+lto = "thin"
+strip = true
+
