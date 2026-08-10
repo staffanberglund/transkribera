@@ -1,0 +1,485 @@
+use std::{
+    collections::VecDeque,
+    f32::consts::{PI, TAU},
+    sync::Arc,
+};
+
+use anyhow::{Result, bail};
+use rustfft::{Fft, FftPlanner, num_complex::Complex32};
+
+use super::window::periodic_hann;
+
+/// Time required for an exponential speed transition to cover about 63% of
+/// the distance to its target, measured on the source timeline.
+const SPEED_SMOOTHING_TIME_SECONDS: f32 = 0.050;
+const NORMALIZATION_EPSILON: f32 = 1e-8;
+
+/// Everything needed to construct one independent phase-vocoder processing unit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PhaseVocoderConfig {
+    pub sample_rate: u32,
+    pub fft_size: usize,
+    pub analysis_hop: usize,
+    pub channel_count: usize,
+    pub playback_speed: f32,
+}
+
+struct ChannelState {
+    input: VecDeque<f32>,
+    spectrum: Vec<Complex32>,
+    previous_phase: Vec<f32>,
+    synthesis_phase: Vec<f32>,
+    overlap: VecDeque<f32>,
+    overlap_weight: VecDeque<f32>,
+    phase_initialized: bool,
+}
+
+impl ChannelState {
+    fn new(fft_size: usize) -> Self {
+        let bins = fft_size / 2 + 1;
+        Self {
+            input: VecDeque::with_capacity(fft_size * 2),
+            spectrum: vec![Complex32::default(); fft_size],
+            previous_phase: vec![0.0; bins],
+            synthesis_phase: vec![0.0; bins],
+            overlap: VecDeque::from(vec![0.0; fft_size]),
+            overlap_weight: VecDeque::from(vec![0.0; fft_size]),
+            phase_initialized: false,
+        }
+    }
+
+    fn reset(&mut self, fft_size: usize) {
+        self.input.clear();
+        self.spectrum.fill(Complex32::default());
+        self.previous_phase.fill(0.0);
+        self.synthesis_phase.fill(0.0);
+        self.overlap.clear();
+        self.overlap.resize(fft_size, 0.0);
+        self.overlap_weight.clear();
+        self.overlap_weight.resize(fft_size, 0.0);
+        self.phase_initialized = false;
+    }
+}
+
+/// A conventional STFT phase vocoder for interleaved `f32` PCM.
+///
+/// `playback_speed` means output tempo divided by source tempo: `0.5` produces
+/// approximately twice as many output samples, while `1.5` produces roughly
+/// two thirds as many. Consequently `synthesis_hop = analysis_hop / speed`.
+pub struct PhaseVocoder {
+    sample_rate: u32,
+    channel_count: usize,
+    fft_size: usize,
+    analysis_hop: usize,
+    window: Vec<f32>,
+    forward_fft: Arc<dyn Fft<f32>>,
+    inverse_fft: Arc<dyn Fft<f32>>,
+    channel_state: Vec<ChannelState>,
+    target_playback_speed: f32,
+    current_playback_speed: f32,
+    speed_smoothing_coefficient: f32,
+    synthesis_hop_fraction: f32,
+    pending_real_frames: usize,
+    processed_frames: u64,
+}
+
+impl PhaseVocoder {
+    pub fn new(config: PhaseVocoderConfig) -> Result<Self> {
+        let PhaseVocoderConfig {
+            sample_rate,
+            fft_size,
+            analysis_hop,
+            channel_count,
+            playback_speed,
+        } = config;
+        if sample_rate == 0 {
+            bail!("sample rate must be greater than zero");
+        }
+        if !(1..=2).contains(&channel_count) {
+            bail!("phase vocoder supports one or two channels, not {channel_count}");
+        }
+        if fft_size < 2 || !fft_size.is_power_of_two() {
+            bail!("FFT size must be a power of two greater than one");
+        }
+        if analysis_hop == 0 || analysis_hop > fft_size {
+            bail!("analysis hop must be between one and the FFT size");
+        }
+        validate_playback_speed(playback_speed)?;
+
+        let mut planner = FftPlanner::<f32>::new();
+        let forward_fft = planner.plan_fft_forward(fft_size);
+        let inverse_fft = planner.plan_fft_inverse(fft_size);
+
+        Ok(Self {
+            sample_rate,
+            channel_count,
+            fft_size,
+            analysis_hop,
+            window: periodic_hann(fft_size),
+            forward_fft,
+            inverse_fft,
+            channel_state: (0..channel_count)
+                .map(|_| ChannelState::new(fft_size))
+                .collect(),
+            target_playback_speed: playback_speed,
+            current_playback_speed: playback_speed,
+            speed_smoothing_coefficient: speed_smoothing_coefficient(sample_rate, analysis_hop),
+            synthesis_hop_fraction: 0.0,
+            pending_real_frames: 0,
+            processed_frames: 0,
+        })
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub fn latency_frames(&self) -> usize {
+        self.fft_size - self.analysis_hop
+    }
+
+    pub fn set_playback_speed(&mut self, playback_speed: f32) -> Result<()> {
+        validate_playback_speed(playback_speed)?;
+        self.target_playback_speed = playback_speed;
+        if self.processed_frames == 0 {
+            self.current_playback_speed = playback_speed;
+        }
+        Ok(())
+    }
+
+    pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) -> Result<()> {
+        if !input.len().is_multiple_of(self.channel_count) {
+            bail!("interleaved input does not contain complete audio frames");
+        }
+
+        let frames = input.len() / self.channel_count;
+        self.pending_real_frames = self.pending_real_frames.saturating_add(frames);
+        for frame in input.chunks_exact(self.channel_count) {
+            for (channel, sample) in self.channel_state.iter_mut().zip(frame) {
+                channel.input.push_back(*sample);
+            }
+        }
+        self.process_available(output);
+        Ok(())
+    }
+
+    pub fn flush(&mut self, output: &mut Vec<f32>) -> Result<()> {
+        while self.pending_real_frames > 0 {
+            for channel in &mut self.channel_state {
+                channel.input.resize(self.fft_size, 0.0);
+            }
+            self.process_frame(output);
+        }
+
+        let remaining = self
+            .channel_state
+            .first()
+            .map_or(0, |channel| channel.overlap.len());
+        self.emit_output(remaining, output);
+        Ok(())
+    }
+
+    pub fn reset(&mut self) {
+        for channel in &mut self.channel_state {
+            channel.reset(self.fft_size);
+        }
+        self.current_playback_speed = self.target_playback_speed;
+        self.synthesis_hop_fraction = 0.0;
+        self.pending_real_frames = 0;
+        self.processed_frames = 0;
+    }
+
+    fn process_available(&mut self, output: &mut Vec<f32>) {
+        while self
+            .channel_state
+            .first()
+            .is_some_and(|channel| channel.input.len() >= self.fft_size)
+        {
+            self.process_frame(output);
+        }
+    }
+
+    fn process_frame(&mut self, output: &mut Vec<f32>) {
+        if self.processed_frames > 0 {
+            self.current_playback_speed += (self.target_playback_speed
+                - self.current_playback_speed)
+                * self.speed_smoothing_coefficient;
+            if (self.target_playback_speed - self.current_playback_speed).abs() < 1e-4 {
+                self.current_playback_speed = self.target_playback_speed;
+            }
+        }
+
+        let synthesis_hop_exact = self.analysis_hop as f32 / self.current_playback_speed;
+        let synthesis_hop_with_fraction = synthesis_hop_exact + self.synthesis_hop_fraction;
+        let synthesis_hop = synthesis_hop_with_fraction.floor().max(1.0) as usize;
+        self.synthesis_hop_fraction = synthesis_hop_with_fraction - synthesis_hop as f32;
+
+        for channel in &mut self.channel_state {
+            for (index, (sample, window)) in channel
+                .input
+                .iter()
+                .take(self.fft_size)
+                .zip(&self.window)
+                .enumerate()
+            {
+                channel.spectrum[index] = Complex32::new(sample * window, 0.0);
+            }
+            self.forward_fft.process(&mut channel.spectrum);
+
+            let bins = self.fft_size / 2 + 1;
+            for bin in 0..bins {
+                let input_bin = channel.spectrum[bin];
+                let magnitude = input_bin.norm();
+                let phase = input_bin.arg();
+                if channel.phase_initialized {
+                    let expected_phase_advance =
+                        TAU * bin as f32 * self.analysis_hop as f32 / self.fft_size as f32;
+                    let deviation =
+                        wrap_phase(phase - channel.previous_phase[bin] - expected_phase_advance);
+                    let instantaneous_angular_frequency = TAU * bin as f32 / self.fft_size as f32
+                        + deviation / self.analysis_hop as f32;
+                    channel.synthesis_phase[bin] +=
+                        instantaneous_angular_frequency * synthesis_hop as f32;
+                } else {
+                    channel.synthesis_phase[bin] = phase;
+                }
+                channel.previous_phase[bin] = phase;
+                channel.spectrum[bin] =
+                    Complex32::from_polar(magnitude, channel.synthesis_phase[bin]);
+            }
+            channel.phase_initialized = true;
+
+            for bin in 1..self.fft_size / 2 {
+                channel.spectrum[self.fft_size - bin] = channel.spectrum[bin].conj();
+            }
+            self.inverse_fft.process(&mut channel.spectrum);
+
+            channel.overlap.resize(self.fft_size, 0.0);
+            channel.overlap_weight.resize(self.fft_size, 0.0);
+            let inverse_scale = 1.0 / self.fft_size as f32;
+            for index in 0..self.fft_size {
+                channel.overlap[index] +=
+                    channel.spectrum[index].re * inverse_scale * self.window[index];
+                channel.overlap_weight[index] += self.window[index] * self.window[index];
+            }
+            for _ in 0..self.analysis_hop.min(channel.input.len()) {
+                channel.input.pop_front();
+            }
+        }
+
+        self.pending_real_frames = self.pending_real_frames.saturating_sub(self.analysis_hop);
+        self.processed_frames += 1;
+        self.emit_output(synthesis_hop, output);
+    }
+
+    fn emit_output(&mut self, frames: usize, output: &mut Vec<f32>) {
+        output.reserve(frames.saturating_mul(self.channel_count));
+        for _ in 0..frames {
+            for channel in &mut self.channel_state {
+                let sample = channel.overlap.pop_front().unwrap_or(0.0);
+                let weight = channel.overlap_weight.pop_front().unwrap_or(0.0);
+                output.push(if weight > NORMALIZATION_EPSILON {
+                    sample / weight
+                } else {
+                    0.0
+                });
+                channel.overlap.push_back(0.0);
+                channel.overlap_weight.push_back(0.0);
+            }
+        }
+    }
+}
+
+fn validate_playback_speed(playback_speed: f32) -> Result<()> {
+    if !playback_speed.is_finite() || playback_speed <= 0.0 {
+        bail!("playback speed must be finite and greater than zero");
+    }
+    Ok(())
+}
+
+fn speed_smoothing_coefficient(sample_rate: u32, analysis_hop: usize) -> f32 {
+    let frame_duration_seconds = analysis_hop as f32 / sample_rate as f32;
+    1.0 - (-frame_duration_seconds / SPEED_SMOOTHING_TIME_SECONDS).exp()
+}
+
+pub fn wrap_phase(phase: f32) -> f32 {
+    (phase + PI).rem_euclid(TAU) - PI
+}
+
+#[cfg(test)]
+mod tests {
+    use std::f32::consts::{PI, TAU};
+
+    use super::{
+        PhaseVocoder, PhaseVocoderConfig, SPEED_SMOOTHING_TIME_SECONDS,
+        speed_smoothing_coefficient, wrap_phase,
+    };
+
+    const SAMPLE_RATE: u32 = 48_000;
+    const FFT_SIZE: usize = 2048;
+    const ANALYSIS_HOP: usize = 512;
+
+    fn sine_wave(frequency: f32, seconds: f32, channels: usize) -> Vec<f32> {
+        let frames = (SAMPLE_RATE as f32 * seconds) as usize;
+        let mut samples = Vec::with_capacity(frames * channels);
+        for frame in 0..frames {
+            let sample = (TAU * frequency * frame as f32 / SAMPLE_RATE as f32).sin() * 0.5;
+            samples.extend(std::iter::repeat_n(sample, channels));
+        }
+        samples
+    }
+
+    fn process_at_speed(input: &[f32], channels: usize, speed: f32) -> Vec<f32> {
+        let mut vocoder = PhaseVocoder::new(PhaseVocoderConfig {
+            sample_rate: SAMPLE_RATE,
+            fft_size: FFT_SIZE,
+            analysis_hop: ANALYSIS_HOP,
+            channel_count: channels,
+            playback_speed: speed,
+        })
+        .unwrap();
+        let mut output = Vec::new();
+        for chunk in input.chunks(4096 * channels) {
+            vocoder.process(chunk, &mut output).unwrap();
+        }
+        vocoder.flush(&mut output).unwrap();
+        output
+    }
+
+    fn frequency_from_positive_crossings(samples: &[f32]) -> f32 {
+        let trim = FFT_SIZE * 2;
+        let usable = &samples[trim.min(samples.len())..samples.len().saturating_sub(trim)];
+        let crossings = usable
+            .windows(2)
+            .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
+            .count();
+        crossings as f32 * SAMPLE_RATE as f32 / usable.len() as f32
+    }
+
+    fn assert_duration(input_frames: usize, output_frames: usize, speed: f32) {
+        let expected = input_frames as f32 / speed;
+        let tolerance = FFT_SIZE as f32 * 2.0;
+        assert!(
+            (output_frames as f32 - expected).abs() <= tolerance,
+            "{output_frames} output frames differs from expected {expected}"
+        );
+    }
+
+    #[test]
+    fn phase_wrapping_uses_minus_pi_to_pi_interval() {
+        assert!((wrap_phase(0.0) - 0.0).abs() < 1e-6);
+        assert!((wrap_phase(PI) + PI).abs() < 1e-6);
+        assert!((wrap_phase(-PI) + PI).abs() < 1e-6);
+        assert!((wrap_phase(3.0 * PI) + PI).abs() < 1e-5);
+        assert!((wrap_phase(-3.0 * PI) + PI).abs() < 1e-5);
+        assert!((wrap_phase(8.0 * TAU + 0.25) - 0.25).abs() < 1e-5);
+    }
+
+    #[test]
+    fn speed_smoothing_depends_on_elapsed_time_not_hop_size() {
+        fn remaining_distance_after(
+            sample_rate: u32,
+            analysis_hop: usize,
+            frame_count: i32,
+        ) -> f32 {
+            let coefficient = speed_smoothing_coefficient(sample_rate, analysis_hop);
+            (1.0 - coefficient).powi(frame_count)
+        }
+
+        // Both configurations advance exactly 100 ms of source audio.
+        let coarse_hop_remaining = remaining_distance_after(48_000, 480, 10);
+        let fine_hop_remaining = remaining_distance_after(48_000, 120, 40);
+        let expected = (-0.1 / SPEED_SMOOTHING_TIME_SECONDS).exp();
+
+        assert!((coarse_hop_remaining - fine_hop_remaining).abs() < 1e-6);
+        assert!((coarse_hop_remaining - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn construction_accepts_a_non_default_configuration() {
+        let vocoder = PhaseVocoder::new(PhaseVocoderConfig {
+            sample_rate: 44_100,
+            fft_size: 1024,
+            analysis_hop: 128,
+            channel_count: 2,
+            playback_speed: 0.8,
+        })
+        .unwrap();
+
+        assert_eq!(vocoder.sample_rate(), 44_100);
+        assert_eq!(vocoder.latency_frames(), 896);
+    }
+
+    #[test]
+    fn unity_speed_preserves_duration_pitch_and_reasonable_gain() {
+        let input = sine_wave(440.0, 2.0, 1);
+        let output = process_at_speed(&input, 1, 1.0);
+        assert!(!output.is_empty());
+        assert_duration(input.len(), output.len(), 1.0);
+        assert!((frequency_from_positive_crossings(&output) - 440.0).abs() < 4.0);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        let peak = output
+            .iter()
+            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        assert!((0.25..=0.8).contains(&peak), "unexpected peak {peak}");
+    }
+
+    #[test]
+    fn slower_speed_preserves_pitch_and_doubles_duration() {
+        let input = sine_wave(440.0, 2.0, 1);
+        let output = process_at_speed(&input, 1, 0.5);
+        assert_duration(input.len(), output.len(), 0.5);
+        assert!((frequency_from_positive_crossings(&output) - 440.0).abs() < 5.0);
+    }
+
+    #[test]
+    fn faster_speed_preserves_pitch_and_shortens_duration() {
+        let input = sine_wave(440.0, 2.0, 1);
+        let output = process_at_speed(&input, 1, 1.5);
+        assert_duration(input.len(), output.len(), 1.5);
+        assert!((frequency_from_positive_crossings(&output) - 440.0).abs() < 5.0);
+    }
+
+    #[test]
+    fn stereo_channels_remain_independent_and_interleaved() {
+        let frames = SAMPLE_RATE as usize * 2;
+        let mut input = Vec::with_capacity(frames * 2);
+        for frame in 0..frames {
+            input.push((TAU * 440.0 * frame as f32 / SAMPLE_RATE as f32).sin() * 0.5);
+            input.push((TAU * 660.0 * frame as f32 / SAMPLE_RATE as f32).sin() * 0.5);
+        }
+        let output = process_at_speed(&input, 2, 0.75);
+        assert_eq!(output.len() % 2, 0);
+        let left = output.iter().step_by(2).copied().collect::<Vec<_>>();
+        let right = output
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .copied()
+            .collect::<Vec<_>>();
+        assert!((frequency_from_positive_crossings(&left) - 440.0).abs() < 5.0);
+        assert!((frequency_from_positive_crossings(&right) - 660.0).abs() < 5.0);
+    }
+
+    #[test]
+    fn reset_matches_a_fresh_processor() {
+        let input = sine_wave(440.0, 0.25, 1);
+        let mut reused = PhaseVocoder::new(PhaseVocoderConfig {
+            sample_rate: SAMPLE_RATE,
+            fft_size: FFT_SIZE,
+            analysis_hop: ANALYSIS_HOP,
+            channel_count: 1,
+            playback_speed: 1.0,
+        })
+        .unwrap();
+        let mut discarded = Vec::new();
+        reused.process(&input, &mut discarded).unwrap();
+        reused.reset();
+        let mut reused_output = Vec::new();
+        reused.process(&input, &mut reused_output).unwrap();
+        reused.flush(&mut reused_output).unwrap();
+
+        let fresh_output = process_at_speed(&input, 1, 1.0);
+        assert_eq!(reused_output, fresh_output);
+    }
+}

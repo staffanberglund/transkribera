@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
 };
 
@@ -8,7 +8,10 @@ use gstreamer as gst;
 use gtk::{cairo, gio, glib, prelude::*};
 
 use crate::{
+    markers::{Marker, MarkerStore},
     player::{Player, PlayerEvent},
+    preferences::{Preferences, PreferencesStore},
+    recent::{RecentStore, record as record_recent},
     waveform::WaveformJob,
 };
 
@@ -18,6 +21,7 @@ const MIN_WAVEFORM_ZOOM: f64 = 1.0;
 const MAX_WAVEFORM_ZOOM: f64 = 100.0;
 const ZOOM_OCTAVE_SCROLL_UNITS: f64 = 4.0;
 const PAN_FRACTION_PER_SCROLL_UNIT: f64 = 0.1;
+const MARKER_JUMP_TOLERANCE_NS: u64 = 50_000_000;
 
 pub fn run() {
     let application = gtk::Application::builder().application_id(APP_ID).build();
@@ -28,15 +32,29 @@ pub fn run() {
 struct UiState {
     window: gtk::ApplicationWindow,
     player: Player,
+    beginning_button: gtk::Button,
     play_button: gtk::Button,
     stop_button: gtk::Button,
+    end_button: gtk::Button,
+    add_marker_button: gtk::Button,
+    marker_list: gtk::ListBox,
+    recent_button: gtk::MenuButton,
+    recent_menu: gio::Menu,
+    settings_window: RefCell<Option<gtk::Window>>,
     seek: gtk::Scale,
     time_label: gtk::Label,
     waveform: gtk::DrawingArea,
     waveform_adjustment: gtk::Adjustment,
     waveform_zoom: gtk::Scale,
     spinner: gtk::Spinner,
+    duration: Cell<Option<gst::ClockTime>>,
     peaks: RefCell<Vec<f32>>,
+    markers: RefCell<Vec<Marker>>,
+    marker_store: RefCell<Option<MarkerStore>>,
+    preferences_store: PreferencesStore,
+    prompt_for_marker_name: Cell<bool>,
+    recent_store: RecentStore,
+    recent_files: RefCell<Vec<PathBuf>>,
     progress: Cell<f64>,
     playback_anchor: Cell<gst::ClockTime>,
     anchor_progress: Cell<f64>,
@@ -51,6 +69,8 @@ struct UiState {
 }
 
 fn build_ui(application: &gtk::Application) {
+    install_css();
+
     let player = match Player::new() {
         Ok(player) => player,
         Err(error) => {
@@ -58,14 +78,24 @@ fn build_ui(application: &gtk::Application) {
             return;
         }
     };
+    let preferences_store = PreferencesStore::new();
+    let preferences = preferences_store.load().unwrap_or_else(|error| {
+        log::warn!("could not load settings: {error:#}");
+        Preferences::default()
+    });
+    let recent_store = RecentStore::new();
+    let recent_files = recent_store.load().unwrap_or_else(|error| {
+        log::warn!("could not load recent files: {error:#}");
+        Vec::new()
+    });
 
     let window = gtk::ApplicationWindow::builder()
         .application(application)
         .title("Transcription MVP")
         .default_width(720)
-        .default_height(360)
+        .default_height(460)
         .width_request(360)
-        .height_request(260)
+        .height_request(340)
         .build();
 
     let header = gtk::HeaderBar::new();
@@ -74,6 +104,19 @@ fn build_ui(application: &gtk::Application) {
         .tooltip_text("Open an audio file")
         .build();
     header.pack_start(&open_button);
+    let recent_menu = gio::Menu::new();
+    let recent_popover = gtk::PopoverMenu::from_model(Some(&recent_menu));
+    let recent_button = gtk::MenuButton::builder()
+        .label("Recent")
+        .tooltip_text("Recently opened audio files")
+        .popover(&recent_popover)
+        .build();
+    header.pack_start(&recent_button);
+    let settings_button = gtk::Button::builder()
+        .icon_name("emblem-system-symbolic")
+        .tooltip_text("Settings")
+        .build();
+    header.pack_end(&settings_button);
     window.set_titlebar(Some(&header));
 
     let waveform = gtk::DrawingArea::builder()
@@ -141,42 +184,139 @@ fn build_ui(application: &gtk::Application) {
         .tooltip_text("Play/Pause at current position (K)")
         .sensitive(false)
         .build();
+    let beginning_button = gtk::Button::builder()
+        .icon_name("go-first-symbolic")
+        .tooltip_text("Go to beginning")
+        .sensitive(false)
+        .build();
     let stop_button = gtk::Button::builder()
         .icon_name("media-playback-stop-symbolic")
         .tooltip_text("Stop")
         .sensitive(false)
         .build();
+    let end_button = gtk::Button::builder()
+        .icon_name("go-last-symbolic")
+        .tooltip_text("Go to end")
+        .sensitive(false)
+        .build();
+
+    let volume = gtk::ScaleButton::new(
+        0.0,
+        1.0,
+        0.02,
+        &[
+            "audio-volume-muted-symbolic",
+            "audio-volume-low-symbolic",
+            "audio-volume-medium-symbolic",
+            "audio-volume-high-symbolic",
+        ],
+    );
+    volume.set_value(1.0);
+    volume.set_tooltip_text(Some("Volume"));
+
+    let speed_label = gtk::Label::new(Some("Speed: 1.00×"));
+    let speed = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.25, 1.50, 0.05);
+    speed.set_value(1.0);
+    speed.set_draw_value(false);
+    speed.set_width_request(130);
+    speed.set_tooltip_text(Some("Playback speed with pitch preservation"));
+    let tempo_bypass = gtk::CheckButton::with_label("Bypass");
+    tempo_bypass.set_tooltip_text(Some(
+        "Play decoded audio directly without phase-vocoder processing",
+    ));
+    let speed_control = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    speed_control.append(&speed_label);
+    speed_control.append(&speed);
+    speed_control.append(&tempo_bypass);
 
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     controls.set_halign(gtk::Align::Center);
+    controls.append(&beginning_button);
     controls.append(&play_button);
     controls.append(&stop_button);
+    controls.append(&end_button);
+    controls.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    controls.append(&volume);
+    controls.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    controls.append(&speed_control);
 
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    content.set_margin_top(12);
-    content.set_margin_bottom(12);
-    content.set_margin_start(12);
-    content.set_margin_end(12);
-    content.append(&waveform_frame);
-    content.append(&waveform_scrollbar);
-    content.append(&zoom_controls);
-    content.append(&seek);
-    content.append(&time_label);
-    content.append(&controls);
-    window.set_child(Some(&content));
+    let add_marker_button = gtk::Button::builder()
+        .label("Add marker")
+        .tooltip_text("Add a marker at the playhead")
+        .sensitive(false)
+        .build();
+    let marker_list = gtk::ListBox::new();
+    marker_list.set_selection_mode(gtk::SelectionMode::None);
+    marker_list.add_css_class("boxed-list");
+    let marker_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .min_content_height(64)
+        .vexpand(true)
+        .child(&marker_list)
+        .build();
+    let marker_content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    add_marker_button.set_halign(gtk::Align::End);
+    marker_content.append(&add_marker_button);
+    marker_content.append(&marker_scroll);
+    let marker_expander = gtk::Expander::builder()
+        .label("Markers")
+        .expanded(true)
+        .hexpand(true)
+        .vexpand(true)
+        .child(&marker_content)
+        .build();
+
+    let playback_content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    playback_content.append(&waveform_frame);
+    playback_content.append(&waveform_scrollbar);
+    playback_content.append(&zoom_controls);
+    playback_content.append(&seek);
+    playback_content.append(&time_label);
+    playback_content.append(&controls);
+
+    let split = gtk::Paned::new(gtk::Orientation::Vertical);
+    split.add_css_class("marker-split");
+    split.set_wide_handle(true);
+    split.set_resize_start_child(true);
+    split.set_resize_end_child(true);
+    split.set_shrink_start_child(false);
+    split.set_shrink_end_child(false);
+    split.set_position(315);
+    split.set_start_child(Some(&playback_content));
+    split.set_end_child(Some(&marker_expander));
+    split.set_margin_top(12);
+    split.set_margin_bottom(12);
+    split.set_margin_start(12);
+    split.set_margin_end(12);
+    window.set_child(Some(&split));
 
     let state = Rc::new(UiState {
         window,
         player,
+        beginning_button,
         play_button,
         stop_button,
+        end_button,
+        add_marker_button,
+        marker_list,
+        recent_button,
+        recent_menu,
+        settings_window: RefCell::new(None),
         seek,
         time_label,
         waveform,
         waveform_adjustment,
         waveform_zoom,
         spinner,
+        duration: Cell::new(None),
         peaks: RefCell::new(Vec::new()),
+        markers: RefCell::new(Vec::new()),
+        marker_store: RefCell::new(None),
+        preferences_store,
+        prompt_for_marker_name: Cell::new(preferences.prompt_for_marker_name),
+        recent_store,
+        recent_files: RefCell::new(recent_files),
         progress: Cell::new(0.0),
         playback_anchor: Cell::new(gst::ClockTime::ZERO),
         anchor_progress: Cell::new(0.0),
@@ -191,8 +331,14 @@ fn build_ui(application: &gtk::Application) {
     });
 
     configure_waveform_drawing(&state);
+    connect_recent_action(&state);
+    rebuild_recent_menu(&state);
     connect_open_button(&state, &open_button);
+    connect_settings_button(&state, &settings_button);
     connect_playback_controls(&state);
+    connect_marker_controls(&state);
+    connect_volume_control(&state, &volume);
+    connect_speed_control(&state, &speed, &speed_label, &tempo_bypass);
     connect_seeking(&state);
     connect_waveform_zoom(&state);
     connect_waveform_scroll_zoom(&state);
@@ -209,6 +355,26 @@ fn build_ui(application: &gtk::Application) {
     state.window.present();
 }
 
+fn install_css() {
+    let provider = gtk::CssProvider::new();
+    provider.load_from_data(
+        "
+        paned.marker-split > separator {
+            margin-top: 6px;
+            margin-bottom: 6px;
+            border-top: 0px solid alpha(@theme_fg_color, 0.24);
+        }
+        ",
+    );
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+}
+
 fn configure_waveform_drawing(state: &Rc<UiState>) {
     let weak = Rc::downgrade(state);
     state
@@ -217,17 +383,21 @@ fn configure_waveform_drawing(state: &Rc<UiState>) {
             let Some(state) = weak.upgrade() else {
                 return;
             };
+            let peaks = state.peaks.borrow();
+            let markers = state.markers.borrow();
             draw_waveform(
                 context,
                 width as f64,
                 height as f64,
-                &state.peaks.borrow(),
-                state.progress.get(),
-                state.anchor_progress.get(),
-                (
-                    state.waveform_adjustment.value(),
-                    state.waveform_adjustment.page_size(),
-                ),
+                WaveformView {
+                    peaks: &peaks,
+                    markers: &markers,
+                    duration_ns: state.duration.get().map(|duration| duration.nseconds()),
+                    progress: state.progress.get(),
+                    anchor_progress: state.anchor_progress.get(),
+                    visible_start: state.waveform_adjustment.value(),
+                    visible_span: state.waveform_adjustment.page_size(),
+                },
             );
         });
 }
@@ -388,7 +558,139 @@ fn connect_open_button(state: &Rc<UiState>, open_button: &gtk::Button) {
     });
 }
 
+fn rebuild_recent_menu(state: &Rc<UiState>) {
+    state.recent_menu.remove_all();
+
+    let files = state.recent_files.borrow().clone();
+    state.recent_button.set_sensitive(!files.is_empty());
+    for path in files {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let label = escape_menu_label(&name);
+        let item = gio::MenuItem::new(Some(&label), None);
+        let target = path.to_string_lossy().into_owned().to_variant();
+        item.set_action_and_target_value(Some("win.open-recent"), Some(&target));
+        state.recent_menu.append_item(&item);
+    }
+}
+
+fn escape_menu_label(label: &str) -> String {
+    label.replace('_', "__")
+}
+
+fn connect_recent_action(state: &Rc<UiState>) {
+    let action = gio::SimpleAction::new("open-recent", Some(&String::static_variant_type()));
+    let weak = Rc::downgrade(state);
+    action.connect_activate(move |_action, parameter| {
+        let Some(path) = parameter.and_then(|value| value.get::<String>()) else {
+            return;
+        };
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        open_file(&state, Path::new(&path));
+    });
+    state.window.add_action(&action);
+}
+
+fn record_recent_file(state: &Rc<UiState>, path: &Path) {
+    let mut files = state.recent_files.borrow_mut();
+    record_recent(&mut files, path);
+    if let Err(error) = state.recent_store.save(&files) {
+        drop(files);
+        show_error(
+            &state.window,
+            "Could not save recent files",
+            &error.to_string(),
+        );
+        return;
+    }
+    drop(files);
+    rebuild_recent_menu(state);
+}
+
+fn connect_settings_button(state: &Rc<UiState>, settings_button: &gtk::Button) {
+    let weak = Rc::downgrade(state);
+    settings_button.connect_clicked(move |_| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        if let Some(window) = state.settings_window.borrow().as_ref() {
+            window.present();
+            return;
+        }
+
+        let window = gtk::Window::builder()
+            .title("Settings")
+            .transient_for(&state.window)
+            .default_width(420)
+            .resizable(false)
+            .build();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
+        content.set_margin_top(18);
+        content.set_margin_bottom(18);
+        content.set_margin_start(18);
+        content.set_margin_end(18);
+
+        let marker_row = gtk::Box::new(gtk::Orientation::Horizontal, 18);
+        let marker_text = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        marker_text.set_hexpand(true);
+        let title = gtk::Label::new(Some("Prompt for marker name"));
+        title.set_xalign(0.0);
+        let description = gtk::Label::new(Some(
+            "When disabled, new markers receive an automatic name.",
+        ));
+        description.set_xalign(0.0);
+        description.set_wrap(true);
+        description.add_css_class("dim-label");
+        marker_text.append(&title);
+        marker_text.append(&description);
+        let prompt_switch = gtk::Switch::new();
+        prompt_switch.set_valign(gtk::Align::Center);
+        prompt_switch.set_active(state.prompt_for_marker_name.get());
+        marker_row.append(&marker_text);
+        marker_row.append(&prompt_switch);
+        content.append(&marker_row);
+        window.set_child(Some(&content));
+
+        let weak = Rc::downgrade(&state);
+        let weak_window = window.downgrade();
+        prompt_switch.connect_active_notify(move |switch| {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            let prompt_for_marker_name = switch.is_active();
+            state.prompt_for_marker_name.set(prompt_for_marker_name);
+            if let Err(error) = state.preferences_store.save(Preferences {
+                prompt_for_marker_name,
+            }) && let Some(window) = weak_window.upgrade()
+            {
+                show_error(&window, "Could not save settings", &error.to_string());
+            }
+        });
+
+        let weak = Rc::downgrade(&state);
+        window.connect_close_request(move |_| {
+            if let Some(state) = weak.upgrade() {
+                state.settings_window.borrow_mut().take();
+            }
+            glib::Propagation::Proceed
+        });
+        state.settings_window.replace(Some(window.clone()));
+        window.present();
+    });
+}
+
 fn connect_playback_controls(state: &Rc<UiState>) {
+    let weak = Rc::downgrade(state);
+    state.beginning_button.connect_clicked(move |_| {
+        if let Some(state) = weak.upgrade() {
+            seek_to_position(&state, gst::ClockTime::ZERO);
+        }
+    });
+
     let weak = Rc::downgrade(state);
     state.play_button.connect_clicked(move |_| {
         let Some(state) = weak.upgrade() else {
@@ -411,6 +713,344 @@ fn connect_playback_controls(state: &Rc<UiState>) {
             update_position(&state, gst::ClockTime::ZERO, state.player.duration());
         }
     });
+
+    let weak = Rc::downgrade(state);
+    state.end_button.connect_clicked(move |_| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        if state.playing.get() {
+            if let Err(error) = state.player.pause() {
+                show_error(
+                    &state.window,
+                    "Could not pause playback",
+                    &error.to_string(),
+                );
+                return;
+            }
+            set_playing(&state, false);
+        }
+        if let Some(duration) = state.duration.get().or_else(|| state.player.duration()) {
+            seek_to_position(&state, duration);
+        }
+    });
+}
+
+fn connect_volume_control(state: &Rc<UiState>, volume: &gtk::ScaleButton) {
+    let weak = Rc::downgrade(state);
+    volume.connect_value_changed(move |_button, value| {
+        if let Some(state) = weak.upgrade() {
+            state.player.set_volume(value);
+        }
+    });
+}
+
+fn connect_speed_control(
+    state: &Rc<UiState>,
+    speed: &gtk::Scale,
+    label: &gtk::Label,
+    bypass: &gtk::CheckButton,
+) {
+    let weak = Rc::downgrade(state);
+    let speed_label = label.clone();
+    let bypass_for_speed = bypass.clone();
+    speed.connect_value_changed(move |scale| {
+        let playback_speed = scale.value() as f32;
+        if bypass_for_speed.is_active() {
+            speed_label.set_text("Speed: bypassed");
+        } else {
+            speed_label.set_text(&format!("Speed: {playback_speed:.2}×"));
+        }
+        if !bypass_for_speed.is_active()
+            && let Some(state) = weak.upgrade()
+            && let Err(error) = state.player.set_playback_speed(playback_speed)
+        {
+            show_error(
+                &state.window,
+                "Could not change playback speed",
+                &error.to_string(),
+            );
+        }
+    });
+
+    let weak = Rc::downgrade(state);
+    let speed = speed.clone();
+    let label = label.clone();
+    bypass.connect_toggled(move |check| {
+        let bypass = check.is_active();
+        speed.set_sensitive(!bypass);
+        if bypass {
+            label.set_text("Speed: bypassed");
+        } else {
+            label.set_text(&format!("Speed: {:.2}×", speed.value()));
+        }
+
+        if let Some(state) = weak.upgrade()
+            && let Err(error) = state.player.set_tempo_bypass(bypass)
+        {
+            show_error(
+                &state.window,
+                "Could not change tempo-processing mode",
+                &error.to_string(),
+            );
+        }
+    });
+}
+
+fn connect_marker_controls(state: &Rc<UiState>) {
+    let weak = Rc::downgrade(state);
+    state.add_marker_button.connect_clicked(move |_| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        let Some(position_ns) = current_marker_position(&state) else {
+            return;
+        };
+        let name = next_generic_marker_name(&state.markers.borrow());
+        if state.prompt_for_marker_name.get() {
+            show_marker_name_dialog(&state, position_ns, name, false);
+        } else {
+            add_named_marker(&state, position_ns, name);
+        }
+    });
+}
+
+fn current_marker_position(state: &UiState) -> Option<u64> {
+    let duration = state.duration.get().or_else(|| state.player.duration())?;
+    Some(
+        state
+            .player
+            .position()
+            .unwrap_or_else(|| state.playback_anchor.get())
+            .min(duration)
+            .nseconds(),
+    )
+}
+
+fn next_generic_marker_name(markers: &[Marker]) -> String {
+    let mut index = 1;
+    loop {
+        let name = format!("Marker {index}");
+        if markers.iter().all(|marker| marker.name != name) {
+            return name;
+        }
+        index += 1;
+    }
+}
+
+fn show_marker_name_dialog(
+    state: &Rc<UiState>,
+    position_ns: u64,
+    initial_name: String,
+    renaming: bool,
+) {
+    let title = if renaming {
+        "Rename marker"
+    } else {
+        "Add marker"
+    };
+    let action_label = if renaming { "Rename" } else { "Add" };
+
+    let dialog = gtk::Window::builder()
+        .title(title)
+        .transient_for(&state.window)
+        .modal(true)
+        .resizable(false)
+        .default_width(360)
+        .build();
+
+    let prompt = gtk::Label::new(Some(&format!(
+        "Marker at {}",
+        format_marker_time(position_ns)
+    )));
+    prompt.set_xalign(0.0);
+    let entry = gtk::Entry::builder()
+        .text(&initial_name)
+        .activates_default(true)
+        .hexpand(true)
+        .build();
+    entry.select_region(0, -1);
+    let form = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    form.set_margin_top(12);
+    form.set_margin_bottom(12);
+    form.set_margin_start(12);
+    form.set_margin_end(12);
+    form.append(&prompt);
+    form.append(&entry);
+
+    let cancel_button = gtk::Button::with_label("Cancel");
+    let add_button = gtk::Button::with_label(action_label);
+    add_button.add_css_class("suggested-action");
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_halign(gtk::Align::End);
+    actions.append(&cancel_button);
+    actions.append(&add_button);
+    form.append(&actions);
+    dialog.set_child(Some(&form));
+    dialog.set_default_widget(Some(&add_button));
+
+    let weak_dialog = dialog.downgrade();
+    cancel_button.connect_clicked(move |_| {
+        if let Some(dialog) = weak_dialog.upgrade() {
+            dialog.close();
+        }
+    });
+
+    let weak = Rc::downgrade(state);
+    let weak_dialog = dialog.downgrade();
+    add_button.connect_clicked(move |_| {
+        if let Some(state) = weak.upgrade() {
+            let entered_name = entry.text();
+            let name = if entered_name.trim().is_empty() {
+                initial_name.clone()
+            } else {
+                entered_name.trim().to_owned()
+            };
+            add_named_marker(&state, position_ns, name);
+        }
+        if let Some(dialog) = weak_dialog.upgrade() {
+            dialog.close();
+        }
+    });
+    dialog.present();
+}
+
+fn add_named_marker(state: &Rc<UiState>, position_ns: u64, name: String) {
+    let mut markers = state.markers.borrow_mut();
+    match markers.binary_search_by_key(&position_ns, |marker| marker.position_ns) {
+        Ok(index) => markers[index].name = name,
+        Err(index) => markers.insert(index, Marker { position_ns, name }),
+    }
+    drop(markers);
+
+    marker_data_changed(state);
+}
+
+fn delete_marker(state: &Rc<UiState>, position_ns: u64) {
+    let mut markers = state.markers.borrow_mut();
+    if let Ok(index) = markers.binary_search_by_key(&position_ns, |marker| marker.position_ns) {
+        markers.remove(index);
+    }
+    drop(markers);
+
+    marker_data_changed(state);
+}
+
+fn marker_data_changed(state: &Rc<UiState>) {
+    rebuild_marker_list(state);
+    state.waveform.queue_draw();
+    if let Err(error) = save_markers(state) {
+        show_error(&state.window, "Could not save markers", &error.to_string());
+    }
+}
+
+fn rebuild_marker_list(state: &Rc<UiState>) {
+    while let Some(child) = state.marker_list.first_child() {
+        state.marker_list.remove(&child);
+    }
+
+    for marker in state.markers.borrow().iter() {
+        let position_ns = marker.position_ns;
+        let marker_name = marker.name.clone();
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let seek_button = gtk::Button::builder()
+            .label(format!(
+                "{} — {}",
+                marker.name,
+                format_marker_time(position_ns)
+            ))
+            .halign(gtk::Align::Fill)
+            .hexpand(true)
+            .focus_on_click(false)
+            .tooltip_text("Seek to marker; right-click for options")
+            .build();
+        let weak = Rc::downgrade(state);
+        seek_button.connect_clicked(move |_| {
+            if let Some(state) = weak.upgrade() {
+                seek_to_position(&state, gst::ClockTime::from_nseconds(position_ns));
+            }
+        });
+        let rename_popover = gtk::Popover::new();
+        let popover_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let context_rename_button = gtk::Button::builder()
+            .label("Rename")
+            .icon_name("document-edit-symbolic")
+            .build();
+        context_rename_button.add_css_class("flat");
+        popover_content.append(&context_rename_button);
+        rename_popover.set_child(Some(&popover_content));
+        rename_popover.set_parent(&row);
+
+        let weak = Rc::downgrade(state);
+        let context_marker_name = marker_name.clone();
+        let context_popover = rename_popover.clone();
+        context_rename_button.connect_clicked(move |_| {
+            context_popover.popdown();
+            if let Some(state) = weak.upgrade() {
+                show_marker_name_dialog(&state, position_ns, context_marker_name.clone(), true);
+            }
+        });
+
+        let context_gesture = gtk::GestureClick::new();
+        context_gesture.set_button(3);
+        let context_popover = rename_popover.clone();
+        context_gesture.connect_released(move |gesture, _press_count, x, y| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            let pointing_to = gtk::gdk::Rectangle::new(x.round() as i32, y.round() as i32, 1, 1);
+            context_popover.set_pointing_to(Some(&pointing_to));
+            context_popover.popup();
+        });
+        row.add_controller(context_gesture);
+
+        let rename_button = gtk::Button::builder()
+            .icon_name("document-edit-symbolic")
+            .tooltip_text("Rename marker")
+            .build();
+        let weak = Rc::downgrade(state);
+        rename_button.connect_clicked(move |_| {
+            if let Some(state) = weak.upgrade() {
+                show_marker_name_dialog(&state, position_ns, marker_name.clone(), true);
+            }
+        });
+        let delete_button = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Delete marker")
+            .build();
+        let weak = Rc::downgrade(state);
+        delete_button.connect_clicked(move |_| {
+            if let Some(state) = weak.upgrade() {
+                delete_marker(&state, position_ns);
+            }
+        });
+        row.append(&seek_button);
+        row.append(&rename_button);
+        row.append(&delete_button);
+        state.marker_list.append(&row);
+    }
+}
+
+fn save_markers(state: &UiState) -> anyhow::Result<()> {
+    let store = state.marker_store.borrow();
+    let Some(store) = store.as_ref() else {
+        return Ok(());
+    };
+    store.save(&state.markers.borrow())
+}
+
+fn format_marker_time(position_ns: u64) -> String {
+    let total_milliseconds = position_ns / 1_000_000;
+    let milliseconds = total_milliseconds % 1_000;
+    let total_seconds = total_milliseconds / 1_000;
+    let seconds = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    let minutes = total_minutes % 60;
+    let hours = total_minutes / 60;
+
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}.{milliseconds:03}")
+    } else {
+        format!("{minutes:02}:{seconds:02}.{milliseconds:03}")
+    }
 }
 
 fn connect_keyboard_controls(state: &Rc<UiState>) {
@@ -422,23 +1062,114 @@ fn connect_keyboard_controls(state: &Rc<UiState>) {
         let Some(state) = weak.upgrade() else {
             return glib::Propagation::Proceed;
         };
-        let command_modifiers = gtk::gdk::ModifierType::CONTROL_MASK
-            | gtk::gdk::ModifierType::ALT_MASK
+        let reserved_modifiers = gtk::gdk::ModifierType::CONTROL_MASK
             | gtk::gdk::ModifierType::SUPER_MASK
             | gtk::gdk::ModifierType::META_MASK;
-        if modifiers.intersects(command_modifiers) {
+        if modifiers.intersects(reserved_modifiers) {
             return glib::Propagation::Proceed;
+        }
+
+        if modifiers.contains(gtk::gdk::ModifierType::ALT_MASK) {
+            match key {
+                gtk::gdk::Key::Left => jump_to_marker(&state, MarkerDirection::Previous),
+                gtk::gdk::Key::Right => jump_to_marker(&state, MarkerDirection::Next),
+                _ => return glib::Propagation::Proceed,
+            }
+            return glib::Propagation::Stop;
         }
 
         match key {
             gtk::gdk::Key::k | gtk::gdk::Key::K => toggle_current_playback(&state),
             gtk::gdk::Key::space => play_from_anchor(&state, true),
             gtk::gdk::Key::p | gtk::gdk::Key::P => play_from_anchor(&state, false),
+            gtk::gdk::Key::j | gtk::gdk::Key::J => seek_relative(&state, -10),
+            gtk::gdk::Key::l | gtk::gdk::Key::L => seek_relative(&state, 10),
+            gtk::gdk::Key::Left => seek_relative(&state, -1),
+            gtk::gdk::Key::Right => seek_relative(&state, 1),
             _ => return glib::Propagation::Proceed,
         }
         glib::Propagation::Stop
     });
     state.window.add_controller(controller);
+}
+
+#[derive(Clone, Copy)]
+enum MarkerDirection {
+    Previous,
+    Next,
+}
+
+fn jump_to_marker(state: &Rc<UiState>, direction: MarkerDirection) {
+    if !state.player.is_loaded() {
+        return;
+    }
+
+    let current_ns = state
+        .player
+        .position()
+        .unwrap_or_else(|| state.playback_anchor.get())
+        .nseconds();
+    let markers = state.markers.borrow();
+    let Some(position_ns) = marker_jump_target(&markers, current_ns, direction) else {
+        return;
+    };
+    drop(markers);
+
+    seek_to_position(state, gst::ClockTime::from_nseconds(position_ns));
+}
+
+fn marker_jump_target(
+    markers: &[Marker],
+    current_ns: u64,
+    direction: MarkerDirection,
+) -> Option<u64> {
+    match direction {
+        MarkerDirection::Previous => markers.iter().rev().find(|marker| {
+            marker.position_ns < current_ns.saturating_sub(MARKER_JUMP_TOLERANCE_NS)
+        }),
+        MarkerDirection::Next => markers.iter().find(|marker| {
+            marker.position_ns > current_ns.saturating_add(MARKER_JUMP_TOLERANCE_NS)
+        }),
+    }
+    .map(|marker| marker.position_ns)
+}
+
+fn seek_relative(state: &Rc<UiState>, seconds: i64) {
+    if !state.player.is_loaded() {
+        return;
+    }
+
+    let current = state
+        .player
+        .position()
+        .unwrap_or_else(|| state.playback_anchor.get());
+    let current_ns = i128::from(current.nseconds());
+    let offset_ns = i128::from(seconds) * 1_000_000_000;
+    let duration_ns = state
+        .duration
+        .get()
+        .or_else(|| state.player.duration())
+        .map(|duration| i128::from(duration.nseconds()))
+        .unwrap_or(i128::MAX);
+    let target_ns = (current_ns + offset_ns).clamp(0, duration_ns) as u64;
+    seek_to_position(state, gst::ClockTime::from_nseconds(target_ns));
+}
+
+fn seek_to_position(state: &Rc<UiState>, position: gst::ClockTime) {
+    if !state.player.is_loaded() {
+        return;
+    }
+
+    let duration = state.duration.get().or_else(|| state.player.duration());
+    let position = duration
+        .map(|duration| position.min(duration))
+        .unwrap_or(position);
+    if let Err(error) = state.player.seek(position) {
+        show_error(&state.window, "Could not seek", &error.to_string());
+    } else {
+        set_playback_anchor(state, position, duration);
+        update_position(state, position, duration);
+    }
 }
 
 fn toggle_current_playback(state: &Rc<UiState>) {
@@ -577,16 +1308,34 @@ fn open_file(state: &Rc<UiState>, path: &Path) {
         Ok(()) => {
             set_playing(state, false);
             state.seek.set_sensitive(true);
+            state.beginning_button.set_sensitive(true);
             state.stop_button.set_sensitive(true);
             state.play_button.set_sensitive(true);
+            state.end_button.set_sensitive(true);
+            state.add_marker_button.set_sensitive(true);
+            state.duration.set(None);
             state.peaks.borrow_mut().clear();
             state.progress.set(0.0);
             set_playback_anchor(state, gst::ClockTime::ZERO, None);
             state.waveform_adjustment.set_value(0.0);
+
+            let marker_store = MarkerStore::for_audio(path);
+            match marker_store.load() {
+                Ok(markers) => {
+                    state.markers.replace(markers);
+                }
+                Err(error) => {
+                    state.markers.borrow_mut().clear();
+                    show_error(&state.window, "Could not load markers", &error.to_string());
+                }
+            };
+            state.marker_store.replace(Some(marker_store));
+            rebuild_marker_list(state);
             state.waveform.queue_draw();
             update_position(state, gst::ClockTime::ZERO, None);
 
             let uri = gio::File::for_path(path).uri().to_string();
+            record_recent_file(state, path);
             state.spinner.set_visible(true);
             state.spinner.start();
             state.waveform_job.replace(Some(WaveformJob::start(uri)));
@@ -653,6 +1402,7 @@ fn poll_waveform_job(state: &Rc<UiState>) {
 
 fn update_position(state: &UiState, position: gst::ClockTime, duration: Option<gst::ClockTime>) {
     if let Some(duration) = duration {
+        state.duration.set(Some(duration));
         let precise_duration_seconds = duration.nseconds() as f64 / 1e9;
         state.seek.set_range(0.0, precise_duration_seconds.max(1.0));
         if !state.user_seeking.get() {
@@ -805,18 +1555,19 @@ fn set_playing(state: &Rc<UiState>, playing: bool) {
     }
 }
 
-fn draw_waveform(
-    context: &cairo::Context,
-    width: f64,
-    height: f64,
-    peaks: &[f32],
+struct WaveformView<'a> {
+    peaks: &'a [f32],
+    markers: &'a [Marker],
+    duration_ns: Option<u64>,
     progress: f64,
     anchor_progress: f64,
-    viewport: (f64, f64),
-) {
-    let (visible_start, visible_span) = viewport;
-    let visible_span = visible_span.clamp(1.0 / MAX_WAVEFORM_ZOOM, 1.0);
-    let visible_start = visible_start.clamp(0.0, (1.0 - visible_span).max(0.0));
+    visible_start: f64,
+    visible_span: f64,
+}
+
+fn draw_waveform(context: &cairo::Context, width: f64, height: f64, view: WaveformView<'_>) {
+    let visible_span = view.visible_span.clamp(1.0 / MAX_WAVEFORM_ZOOM, 1.0);
+    let visible_start = view.visible_start.clamp(0.0, (1.0 - visible_span).max(0.0));
     let visible_end = visible_start + visible_span;
 
     context.set_source_rgb(0.16, 0.16, 0.18);
@@ -829,37 +1580,49 @@ fn draw_waveform(
     context.line_to(width, center.floor() + 0.5);
     let _ = context.stroke();
 
-    if peaks.is_empty() {
-        return;
+    if !view.peaks.is_empty() {
+        draw_peaks(
+            context,
+            width,
+            height,
+            view.peaks,
+            visible_start,
+            visible_span,
+            (0.68, 0.68, 0.72),
+        );
+
+        context.save().ok();
+        let cursor_x = ((view.progress - visible_start) / visible_span * width).clamp(0.0, width);
+        context.rectangle(0.0, 0.0, cursor_x, height);
+        context.clip();
+        draw_peaks(
+            context,
+            width,
+            height,
+            view.peaks,
+            visible_start,
+            visible_span,
+            (0.22, 0.62, 0.96),
+        );
+        context.restore().ok();
     }
 
-    draw_peaks(
-        context,
-        width,
-        height,
-        peaks,
-        visible_start,
-        visible_span,
-        (0.68, 0.68, 0.72),
-    );
+    if let Some(duration_ns) = view.duration_ns.filter(|duration| *duration > 0) {
+        context.set_source_rgba(0.38, 0.85, 0.55, 0.9);
+        context.set_line_width(1.0);
+        for marker in view.markers {
+            let marker_progress = marker.position_ns as f64 / duration_ns as f64;
+            if (visible_start..=visible_end).contains(&marker_progress) {
+                let marker_x = (marker_progress - visible_start) / visible_span * width;
+                context.move_to(marker_x.floor() + 0.5, 0.0);
+                context.line_to(marker_x.floor() + 0.5, height);
+            }
+        }
+        let _ = context.stroke();
+    }
 
-    context.save().ok();
-    let cursor_x = ((progress - visible_start) / visible_span * width).clamp(0.0, width);
-    context.rectangle(0.0, 0.0, cursor_x, height);
-    context.clip();
-    draw_peaks(
-        context,
-        width,
-        height,
-        peaks,
-        visible_start,
-        visible_span,
-        (0.22, 0.62, 0.96),
-    );
-    context.restore().ok();
-
-    if (visible_start..=visible_end).contains(&anchor_progress) {
-        let anchor_x = (anchor_progress - visible_start) / visible_span * width;
+    if (visible_start..=visible_end).contains(&view.anchor_progress) {
+        let anchor_x = (view.anchor_progress - visible_start) / visible_span * width;
         context.set_source_rgb(1.0, 0.67, 0.18);
         context.set_line_width(2.5);
         context.move_to(anchor_x, 0.0);
@@ -867,8 +1630,8 @@ fn draw_waveform(
         let _ = context.stroke();
     }
 
-    if (visible_start..=visible_end).contains(&progress) {
-        let cursor_x = (progress - visible_start) / visible_span * width;
+    if (visible_start..=visible_end).contains(&view.progress) {
+        let cursor_x = (view.progress - visible_start) / visible_span * width;
         context.set_source_rgb(0.95, 0.95, 0.98);
         context.set_line_width(1.5);
         context.move_to(cursor_x, 0.0);
@@ -970,7 +1733,10 @@ fn show_startup_error(application: &gtk::Application, details: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{pan_viewport, timeline_fraction_at_x, zoom_after_scroll, zoomed_viewport};
+    use super::{
+        Marker, MarkerDirection, escape_menu_label, marker_jump_target, next_generic_marker_name,
+        pan_viewport, timeline_fraction_at_x, zoom_after_scroll, zoomed_viewport,
+    };
 
     fn assert_close(actual: f64, expected: f64) {
         assert!((actual - expected).abs() < 1e-12, "{actual} != {expected}");
@@ -1020,5 +1786,39 @@ mod tests {
         assert_close(pan_viewport(0.25, 0.2, 1.0), 0.27);
         assert_close(pan_viewport(0.0, 0.2, -1.0), 0.0);
         assert_close(pan_viewport(0.8, 0.2, 1.0), 0.8);
+    }
+
+    #[test]
+    fn marker_jumps_move_to_the_adjacent_marker() {
+        let markers = [1, 2, 3].map(|seconds| Marker {
+            position_ns: seconds * 1_000_000_000,
+            name: seconds.to_string(),
+        });
+
+        assert_eq!(
+            marker_jump_target(&markers, 2_000_000_000, MarkerDirection::Previous),
+            Some(1_000_000_000)
+        );
+        assert_eq!(
+            marker_jump_target(&markers, 2_000_000_000, MarkerDirection::Next),
+            Some(3_000_000_000)
+        );
+    }
+
+    #[test]
+    fn generic_marker_names_fill_the_first_available_number() {
+        let markers = ["Marker 1", "Marker 3"].map(|name| Marker {
+            position_ns: 0,
+            name: name.into(),
+        });
+        assert_eq!(next_generic_marker_name(&markers), "Marker 2");
+    }
+
+    #[test]
+    fn recent_menu_labels_preserve_underscores() {
+        assert_eq!(
+            escape_menu_label("first_interview.flac"),
+            "first__interview.flac"
+        );
     }
 }

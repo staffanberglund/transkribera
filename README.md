@@ -8,13 +8,28 @@ playback features.
 ## Current functionality
 
 - Opens local MP3, FLAC, Opus, and Ogg files with GTK's file chooser.
-- Plays, pauses, stops, and seeks with a slider or a click on the waveform.
+- Keeps a persistent menu of the ten most recently opened audio files.
+- Plays, pauses, stops, jumps to the beginning or end, and provides volume
+  control.
+- Changes playback tempo from 0.25× to 1.50× with an in-project phase vocoder
+  while preserving pitch, with an explicit checkbox to bypass tempo processing
+  and play decoded PCM directly.
+- Seeks with a slider, a click on the waveform, `J`/`L` for ±10 seconds, or
+  Left/Right for ±1 second.
 - Zooms the waveform continuously from 1× to 100×. Slider changes center the
   playhead during playback and otherwise center the playback anchor;
   `Ctrl`+scroll preserves the time beneath the pointer.
 - Pans a zoomed waveform using two-finger scrolling or the timeline scrollbar.
 - Remembers a playback anchor: `K` toggles at the current position, `Space`
   pauses or restarts from the anchor, and `P` always restarts from the anchor.
+- Adds named, clickable, and deletable timeline markers at the playhead, jumps
+  between them with `Alt`+Left/Right, and saves them automatically as JSON for
+  each audio file. Right-clicking a marker opens a Rename menu; its pen button
+  is a direct rename shortcut.
+- Collapses the marker list when it is not needed or resizes it by dragging the
+  divider between the waveform controls and marker pane.
+- Offers a persistent setting to prompt for marker names or assign generic
+  names immediately.
 - Shows elapsed and total time and highlights waveform playback progress.
 - Decodes a normalized, reduced mono waveform on a worker thread.
 - Reports playback and waveform errors without terminating the application.
@@ -63,6 +78,19 @@ flatpak-builder --user --install --force-clean build-dir flatpak/io.github.examp
 flatpak run --user io.github.example.TranscriptionMvp
 ```
 
+For faster development cycles, use the incremental debug build script:
+
+```bash
+./dev-build.sh
+```
+
+The first invocation prepares `build-dir` if necessary and performs a full
+debug build. Later invocations reuse Cargo artifacts in
+`target/flatpak-dev`, install only the changed build into the writable Flatpak
+tree, strip the installed copy while retaining local debug information, export
+it, update the user installation, and launch the app. Use
+`./dev-build.sh --no-run` to build and install without launching it.
+
 The app requests display, GPU, and PulseAudio sockets only. It does not request
 `--filesystem=host`; GTK's file dialog grants access to the selected file through
 the document portal.
@@ -86,7 +114,27 @@ declared runtime. The application never relies on host-installed plugins.
   player events on a 150 ms GLib timer, and renders the visible interval of a
   fixed-size waveform viewport with Cairo.
 - `src/player.rs` is a small `playbin` wrapper for file loading, transport,
-  seeking, position/duration queries, and non-blocking bus event collection.
+  volume, seeking, source-time position/duration queries, and non-blocking bus
+  events. It replaces only `playbin`'s audio sink with the phase-vocoder bin.
+- `src/dsp/phase_vocoder.rs` contains the GStreamer-independent STFT phase
+  vocoder. Each instance receives an explicit sample rate, FFT size, analysis
+  hop, channel count, and initial playback speed.
+- `src/dsp/processor.rs` is the pure-DSP composition boundary. GStreamer owns a
+  boxed `TempoProcessor` and cannot depend on how many phase vocoders it
+  contains or which analysis resolutions they use. The current factory creates
+  one processor at one resolution; a future multiband implementation belongs
+  behind this same interface.
+- `src/dsp/processor.rs` also supplies the default phase-vocoder analysis
+  resolution and loads an optional per-user `dsp.json` override.
+- `src/dsp/window.rs` generates the periodic Hann window.
+- `src/dsp/gst_phase_vocoder.rs` wraps the DSP in a statically registered,
+  in-process GStreamer element accepting interleaved mono or stereo F32LE PCM.
+- `src/markers.rs` loads and atomically saves a versioned JSON marker list in
+  the application's XDG data directory, keyed by the audio file's canonical
+  path.
+- `src/preferences.rs` persists the small application settings file alongside
+  the marker directory.
+- `src/recent.rs` persists and updates the most-recent-first audio file list.
 - `src/waveform.rs` creates a separate `uridecodebin` pipeline ending in an
   `appsink`. A worker decodes mono 8 kHz float PCM, retains fixed-window peaks,
   retains peaks at roughly 8 ms intervals, reduces very long files to at most
@@ -96,12 +144,138 @@ Opening another file stops the previous `playbin`, clears the UI, and cancels th
 previous waveform job. Closing the window drops the job's cancellation token;
 the worker shuts down at its next sample/poll boundary.
 
+## Tempo and phase-vocoder design
+
+The speed control uses this convention:
+
+```text
+playback_speed = output tempo / source tempo
+1.00× = original tempo
+0.75× = slower
+1.25× = faster
+```
+
+The Bypass checkbox temporarily disables the speed control and forwards decoded
+PCM buffers through the custom GStreamer element without invoking the DSP. The
+selected speed is retained for when bypass is disabled. Changing modes performs
+a flush seek at the current source position so overlap-buffered phase-vocoder
+audio is not mixed with direct audio.
+
+The in-code default uses a 2,048-sample FFT and a 512-sample analysis hop. To
+override it without rebuilding, create
+`$XDG_CONFIG_HOME/transcription-mvp/dsp.json` (normally
+`~/.config/transcription-mvp/dsp.json`; inside Flatpak it is stored below
+`~/.var/app/io.github.example.TranscriptionMvp/config/`) with this structure:
+
+```json
+{
+  "version": 1,
+  "phase_vocoders": [
+    {
+      "fft_size": 2048,
+      "analysis_hop": 512
+    }
+  ]
+}
+```
+
+The override is read when an audio stream is opened. This version validates
+that exactly one entry is present; the list representation is reserved for the
+future multiband implementation.
+The phase-vocoder unit uses a periodic Hann window and its synthesis hop is:
+
+```text
+synthesis_hop = analysis_hop / playback_speed
+```
+
+Fractional hops are carried between frames so they do not accumulate a duration
+error. Exponential smoothing with a 50 ms source-time constant softens changes
+made after processing has started. Its per-frame coefficient is derived from
+the sample rate and analysis hop, so changing either does not change the
+transition duration.
+
+For each channel independently, the processor buffers overlapping frames,
+windows them, performs a forward FFT, extracts magnitude and phase, subtracts
+the expected bin-phase advance, wraps the deviation into `[-π, π)`, estimates
+instantaneous frequency, accumulates phase using the synthesis hop, reconstructs
+the conjugate-symmetric spectrum, performs the inverse FFT, applies the Hann
+window again, and overlap-adds with per-sample window-power normalization.
+
+The initial input fill is 2,048 samples (about 42.7 ms at 48 kHz). The element
+reports the steady-state overlap latency of 1,536 samples (about 32 ms at
+48 kHz) through GStreamer's latency query.
+
+### GStreamer integration and time
+
+The application registers `rustphasevocoder` statically after `gst::init()`; it
+does not install or discover an external plugin. `playbin` continues to select
+demuxers and decoders. Its custom audio sink is:
+
+```text
+playbin decoded audio
+  → audioconvert
+  → audioresample
+  → audio/x-raw, format=F32LE, layout=interleaved, channels=1..2
+  → rustphasevocoder
+  → audioconvert
+  → audioresample
+  → autoaudiosink
+```
+
+Input buffer timestamps remain source-media time. Output timestamps begin at
+the current source segment start and then advance by the duration of the
+produced PCM. Slower playback therefore produces more output clock time and
+faster playback produces less. The player deliberately reports the latest
+input/source timestamp to the UI, so the seek slider, waveform, markers, and
+time label always refer to the original media timeline. Duration queries and
+seek requests also remain in source time.
+
+Flush, new-segment, discontinuity, stop, state reset, and opening another file
+clear pending input, phase history, overlap-add data, and pending output. EOS
+pads and processes the final partial frame, emits the remaining overlap-add
+tail, and then forwards EOS.
+
+Marker files are stored under
+`$XDG_DATA_HOME/transcription-mvp/markers/` when running natively. The Flatpak
+location is normally
+`~/.var/app/io.github.example.TranscriptionMvp/data/transcription-mvp/markers/`.
+Each JSON file records the source path plus marker names and positions in
+nanoseconds. Application settings are stored in `settings.json` one directory
+above the marker files, with recent paths in `recent.json` beside it.
+
 ## Known limitations
 
 - Waveforms appear after full-file analysis; generation is not progressive.
 - Waveform peaks are optimized for navigation, not sample-accurate editing.
 - Duration and seeking depend on what the selected container/decoder reports.
-- There are no playlists, loops, markers, speed/pitch controls, or editing tools.
+- Markers do not yet support notes or drag-to-reposition.
+- There are no playlists, loops, independent pitch controls, or editing tools.
+- The basic phase vocoder can smear sharp transients, sound phasy on complex
+  material, and make the stereo image less stable because channels are
+  processed independently. Artifacts are strongest near 0.25× and 1.50×.
+- Speed changes use time-based smoothing but do not yet share one central
+  source-to-output time map across multiple processors.
+- Only mono and stereo playback are negotiated through the phase vocoder.
+
+## Manual tempo test procedure
+
+Test spoken voice, sustained music, percussion-heavy music, and stereo music
+in MP3, FLAC, and Opus/Ogg form. For each file, try 0.50×, 0.75×, 1.00×, 1.25×,
+and 1.50× and check:
+
+1. Pitch remains approximately unchanged while tempo changes.
+2. Playback remains stable while repeatedly moving the speed slider.
+3. The position display and waveform continue to show source-media time.
+4. Waveform clicks, the seek slider, and keyboard seeks work at every speed.
+5. Pause/resume, stop, end of stream, and opening another file do not replay
+   stale audio.
+6. Stereo channels remain distinct and the GTK interface stays responsive.
+7. The same checks pass in the installed Flatpak.
+
+Automated DSP tests use generated sine waves to validate phase wrapping,
+unity/slow/fast duration, dominant pitch, finite and reasonable gain, stereo
+interleaving, and reset behavior. A headless GStreamer test validates F32LE
+stereo negotiation, processing, draining, and EOS.
 
 ## Troubleshooting
 
