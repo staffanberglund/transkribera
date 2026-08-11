@@ -126,6 +126,8 @@ declared runtime. The application never relies on host-installed plugins.
   behind this same interface.
 - `src/dsp/processor.rs` also supplies the default phase-vocoder analysis
   resolution and loads an optional per-user `dsp.json` override.
+- `src/dsp/filter_bank.rs` contains the isolated streaming five-band
+  complementary FIR filter bank. It is not connected to playback yet.
 - `src/dsp/window.rs` generates the periodic Hann window.
 - `src/dsp/gst_phase_vocoder.rs` wraps the DSP in a statically registered,
   in-process GStreamer element accepting interleaved mono or stereo F32LE PCM.
@@ -204,6 +206,36 @@ window again, and overlap-adds with per-sample window-power normalization.
 The initial input fill is 2,048 samples (about 42.7 ms at 48 kHz). The element
 reports the steady-state overlap latency of 1,536 samples (about 32 ms at
 48 kHz) through GStreamer's latency query.
+
+### Five-band filter-bank foundation
+
+The next-generation stretch engine begins with a pure-DSP five-band filter
+bank. It accepts a sample rate, channel count, four strictly increasing
+crossover frequencies, and an odd FIR tap count. All four cumulative low-pass
+filters use equal-length, symmetric Blackman-windowed sinc kernels, giving them
+the same linear-phase group delay:
+
+```text
+delay = (tap_count - 1) / 2 frames
+
+band 1 = L1
+band 2 = L2 - L1
+band 3 = L3 - L2
+band 4 = L4 - L3
+band 5 = delayed input - L4
+```
+
+Summing the bands therefore telescopes exactly to the delayed input regardless
+of the individual crossover shapes. The streaming implementation preserves
+interleaved channels, accepts arbitrary complete-frame chunk sizes, emits the
+full FIR tails on flush, and clears all history on reset.
+
+Automated tests cover impulse reconstruction, random chunked stereo
+reconstruction, output-length stability, reset, invalid configurations, and
+tone isolation. The direct-convolution implementation and full-rate band
+outputs deliberately favor a simple verifiable foundation. The filter bank is
+not yet used by `TempoProcessor`; per-band phase vocoders, output alignment,
+FIR optimization, and downsampling are later stages.
 
 ### GStreamer integration and time
 
