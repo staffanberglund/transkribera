@@ -111,11 +111,13 @@ pub fn object_array<'a>(json: &'a str, key: &str) -> Result<Vec<&'a str>> {
     Ok(objects)
 }
 
-pub fn unsigned_integer(json: &str, key: &str) -> Result<u64> {
+pub fn optional_unsigned_integer(json: &str, key: &str) -> Result<Option<u64>> {
     let quoted_key = format!("\"{key}\"");
-    let value = json
-        .split_once(&quoted_key)
-        .and_then(|(_, rest)| rest.split_once(':'))
+    let Some((_, rest)) = json.split_once(&quoted_key) else {
+        return Ok(None);
+    };
+    let value = rest
+        .split_once(':')
         .map(|(_, value)| value.trim_start())
         .with_context(|| format!("missing {key}"))?;
     let digits = value
@@ -125,9 +127,33 @@ pub fn unsigned_integer(json: &str, key: &str) -> Result<u64> {
     if digits.is_empty() {
         bail!("{key} is not an unsigned integer");
     }
-    digits
-        .parse::<u64>()
-        .with_context(|| format!("{key} is outside the supported integer range"))
+    Ok(Some(digits.parse::<u64>().with_context(|| {
+        format!("{key} is outside the supported integer range")
+    })?))
+}
+
+pub fn unsigned_integer(json: &str, key: &str) -> Result<u64> {
+    optional_unsigned_integer(json, key)?.with_context(|| format!("missing {key}"))
+}
+
+pub fn unsigned_integer_array(json: &str, key: &str) -> Result<Vec<u64>> {
+    let values = array(json, key)?;
+    if values.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    values
+        .split(',')
+        .enumerate()
+        .map(|(index, value)| {
+            let value = value.trim();
+            if value.is_empty() || !value.chars().all(|character| character.is_ascii_digit()) {
+                bail!("{key} entry {index} is not an unsigned integer");
+            }
+            value
+                .parse::<u64>()
+                .with_context(|| format!("{key} entry {index} is outside the supported range"))
+        })
+        .collect()
 }
 
 pub fn parse_strings(values: &str) -> Result<Vec<String>> {
@@ -191,7 +217,10 @@ pub fn parse_strings(values: &str) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{array, escape_string, object_array, parse_strings, unsigned_integer};
+    use super::{
+        array, escape_string, object_array, optional_unsigned_integer, parse_strings,
+        unsigned_integer, unsigned_integer_array,
+    };
 
     #[test]
     fn strings_escape_and_parse() {
@@ -205,10 +234,15 @@ mod tests {
 
     #[test]
     fn nested_object_arrays_and_integers_parse() {
-        let json = r#"{"version":1,"items":[{"size":2048},{"size":512}]}"#;
+        let json = r#"{"version":1,"crossovers":[150,600,2400,7000],"items":[{"size":2048},{"size":512}]}"#;
         let objects = object_array(json, "items").unwrap();
         assert_eq!(objects.len(), 2);
         assert_eq!(unsigned_integer(json, "version").unwrap(), 1);
+        assert_eq!(optional_unsigned_integer(json, "missing").unwrap(), None);
+        assert_eq!(
+            unsigned_integer_array(json, "crossovers").unwrap(),
+            [150, 600, 2400, 7000]
+        );
         assert_eq!(unsigned_integer(objects[0], "size").unwrap(), 2048);
         assert_eq!(unsigned_integer(objects[1], "size").unwrap(), 512);
     }

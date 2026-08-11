@@ -12,7 +12,11 @@ use super::window::periodic_hann;
 /// Time required for an exponential speed transition to cover about 63% of
 /// the distance to its target, measured on the source timeline.
 const SPEED_SMOOTHING_TIME_SECONDS: f32 = 0.050;
-const NORMALIZATION_EPSILON: f32 = 1e-8;
+// Values this close to unity are canonicalized so the transparent phase path
+// cannot be missed because of slider or property conversion roundoff.
+const UNITY_SPEED_EPSILON: f32 = 1e-4;
+// Avoid amplifying FFT roundoff at the nearly-zero edges of the final window.
+const NORMALIZATION_EPSILON: f32 = 1e-4;
 
 /// Everything needed to construct one independent phase-vocoder processing unit.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -27,6 +31,10 @@ pub struct PhaseVocoderConfig {
 struct ChannelState {
     input: VecDeque<f32>,
     spectrum: Vec<Complex32>,
+    magnitude: Vec<f32>,
+    analysis_phase: Vec<f32>,
+    propagated_phase: Vec<f32>,
+    spectral_peaks: Vec<usize>,
     previous_phase: Vec<f32>,
     synthesis_phase: Vec<f32>,
     overlap: VecDeque<f32>,
@@ -40,6 +48,10 @@ impl ChannelState {
         Self {
             input: VecDeque::with_capacity(fft_size * 2),
             spectrum: vec![Complex32::default(); fft_size],
+            magnitude: vec![0.0; bins],
+            analysis_phase: vec![0.0; bins],
+            propagated_phase: vec![0.0; bins],
+            spectral_peaks: Vec::with_capacity(bins),
             previous_phase: vec![0.0; bins],
             synthesis_phase: vec![0.0; bins],
             overlap: VecDeque::from(vec![0.0; fft_size]),
@@ -51,6 +63,10 @@ impl ChannelState {
     fn reset(&mut self, fft_size: usize) {
         self.input.clear();
         self.spectrum.fill(Complex32::default());
+        self.magnitude.fill(0.0);
+        self.analysis_phase.fill(0.0);
+        self.propagated_phase.fill(0.0);
+        self.spectral_peaks.clear();
         self.previous_phase.fill(0.0);
         self.synthesis_phase.fill(0.0);
         self.overlap.clear();
@@ -121,8 +137,8 @@ impl PhaseVocoder {
             channel_state: (0..channel_count)
                 .map(|_| ChannelState::new(fft_size))
                 .collect(),
-            target_playback_speed: playback_speed,
-            current_playback_speed: playback_speed,
+            target_playback_speed: canonical_playback_speed(playback_speed),
+            current_playback_speed: canonical_playback_speed(playback_speed),
             speed_smoothing_coefficient: speed_smoothing_coefficient(sample_rate, analysis_hop),
             synthesis_hop_fraction: 0.0,
             pending_real_frames: 0,
@@ -140,6 +156,7 @@ impl PhaseVocoder {
 
     pub fn set_playback_speed(&mut self, playback_speed: f32) -> Result<()> {
         validate_playback_speed(playback_speed)?;
+        let playback_speed = canonical_playback_speed(playback_speed);
         self.target_playback_speed = playback_speed;
         if self.processed_frames == 0 {
             self.current_playback_speed = playback_speed;
@@ -213,6 +230,9 @@ impl PhaseVocoder {
         let synthesis_hop_with_fraction = synthesis_hop_exact + self.synthesis_hop_fraction;
         let synthesis_hop = synthesis_hop_with_fraction.floor().max(1.0) as usize;
         self.synthesis_hop_fraction = synthesis_hop_with_fraction - synthesis_hop as f32;
+        let transparent_unity = self.current_playback_speed == 1.0
+            && self.target_playback_speed == 1.0
+            && synthesis_hop == self.analysis_hop;
 
         for channel in &mut self.channel_state {
             for (index, (sample, window)) in channel
@@ -229,8 +249,9 @@ impl PhaseVocoder {
             let bins = self.fft_size / 2 + 1;
             for bin in 0..bins {
                 let input_bin = channel.spectrum[bin];
-                let magnitude = input_bin.norm();
                 let phase = input_bin.arg();
+                channel.magnitude[bin] = input_bin.norm();
+                channel.analysis_phase[bin] = phase;
                 if channel.phase_initialized {
                     let expected_phase_advance =
                         TAU * bin as f32 * self.analysis_hop as f32 / self.fft_size as f32;
@@ -238,14 +259,34 @@ impl PhaseVocoder {
                         wrap_phase(phase - channel.previous_phase[bin] - expected_phase_advance);
                     let instantaneous_angular_frequency = TAU * bin as f32 / self.fft_size as f32
                         + deviation / self.analysis_hop as f32;
-                    channel.synthesis_phase[bin] +=
+                    channel.propagated_phase[bin] +=
                         instantaneous_angular_frequency * synthesis_hop as f32;
                 } else {
-                    channel.synthesis_phase[bin] = phase;
+                    channel.propagated_phase[bin] = phase;
                 }
                 channel.previous_phase[bin] = phase;
+            }
+
+            if transparent_unity || !channel.phase_initialized {
+                channel
+                    .propagated_phase
+                    .copy_from_slice(&channel.analysis_phase);
+                channel
+                    .synthesis_phase
+                    .copy_from_slice(&channel.analysis_phase);
+            } else {
+                identity_phase_lock(
+                    &channel.magnitude,
+                    &channel.analysis_phase,
+                    &channel.propagated_phase,
+                    &mut channel.synthesis_phase,
+                    &mut channel.spectral_peaks,
+                );
+            }
+
+            for bin in 0..bins {
                 channel.spectrum[bin] =
-                    Complex32::from_polar(magnitude, channel.synthesis_phase[bin]);
+                    Complex32::from_polar(channel.magnitude[bin], channel.synthesis_phase[bin]);
             }
             channel.phase_initialized = true;
 
@@ -297,6 +338,71 @@ fn validate_playback_speed(playback_speed: f32) -> Result<()> {
     Ok(())
 }
 
+fn canonical_playback_speed(playback_speed: f32) -> f32 {
+    if (playback_speed - 1.0).abs() <= UNITY_SPEED_EPSILON {
+        1.0
+    } else {
+        playback_speed
+    }
+}
+
+/// Preserve the analysis-frame phase relationships around spectral peaks.
+///
+/// A conventional phase vocoder advances every FFT bin independently. That
+/// smears a tone or transient across unrelated phases and can reduce its level.
+/// Identity phase locking advances each local peak normally, while surrounding
+/// bins retain their analysis-phase offset from that peak.
+fn identity_phase_lock(
+    magnitude: &[f32],
+    analysis_phase: &[f32],
+    propagated_phase: &[f32],
+    synthesis_phase: &mut [f32],
+    peaks: &mut Vec<usize>,
+) {
+    debug_assert_eq!(magnitude.len(), analysis_phase.len());
+    debug_assert_eq!(magnitude.len(), propagated_phase.len());
+    debug_assert_eq!(magnitude.len(), synthesis_phase.len());
+
+    let bins = magnitude.len();
+    if bins < 3 {
+        synthesis_phase.copy_from_slice(propagated_phase);
+        return;
+    }
+
+    peaks.clear();
+    for bin in 1..bins - 1 {
+        if magnitude[bin] > magnitude[bin - 1] && magnitude[bin] >= magnitude[bin + 1] {
+            peaks.push(bin);
+        }
+    }
+    if peaks.is_empty() {
+        synthesis_phase.copy_from_slice(propagated_phase);
+        return;
+    }
+
+    for (peak_index, &peak) in peaks.iter().enumerate() {
+        let first = if peak_index == 0 {
+            0
+        } else {
+            (peaks[peak_index - 1] + peak) / 2 + 1
+        };
+        let last = if peak_index + 1 == peaks.len() {
+            bins - 1
+        } else {
+            (peak + peaks[peak_index + 1]) / 2
+        };
+        let peak_phase = propagated_phase[peak];
+        for bin in first..=last {
+            synthesis_phase[bin] =
+                peak_phase + wrap_phase(analysis_phase[bin] - analysis_phase[peak]);
+        }
+    }
+
+    // These self-conjugate bins must remain real for a real-valued inverse FFT.
+    synthesis_phase[0] = analysis_phase[0];
+    synthesis_phase[bins - 1] = analysis_phase[bins - 1];
+}
+
 fn speed_smoothing_coefficient(sample_rate: u32, analysis_hop: usize) -> f32 {
     let frame_duration_seconds = analysis_hop as f32 / sample_rate as f32;
     1.0 - (-frame_duration_seconds / SPEED_SMOOTHING_TIME_SECONDS).exp()
@@ -311,7 +417,7 @@ mod tests {
     use std::f32::consts::{PI, TAU};
 
     use super::{
-        PhaseVocoder, PhaseVocoderConfig, SPEED_SMOOTHING_TIME_SECONDS,
+        PhaseVocoder, PhaseVocoderConfig, SPEED_SMOOTHING_TIME_SECONDS, UNITY_SPEED_EPSILON,
         speed_smoothing_coefficient, wrap_phase,
     };
 
@@ -327,6 +433,21 @@ mod tests {
             samples.extend(std::iter::repeat_n(sample, channels));
         }
         samples
+    }
+
+    fn multi_tone(seconds: f32) -> Vec<f32> {
+        let frequencies = [173.0, 440.0, 997.0, 2_137.0, 6_103.0];
+        let frames = (SAMPLE_RATE as f32 * seconds) as usize;
+        (0..frames)
+            .map(|frame| {
+                frequencies
+                    .iter()
+                    .map(|frequency| {
+                        (TAU * frequency * frame as f32 / SAMPLE_RATE as f32).sin() * 0.08
+                    })
+                    .sum()
+            })
+            .collect()
     }
 
     fn process_at_speed(input: &[f32], channels: usize, speed: f32) -> Vec<f32> {
@@ -422,6 +543,82 @@ mod tests {
             .iter()
             .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
         assert!((0.25..=0.8).contains(&peak), "unexpected peak {peak}");
+    }
+
+    #[test]
+    fn unity_speed_reconstructs_the_steady_state_waveform() {
+        let input = multi_tone(4.0);
+        let output = process_at_speed(&input, 1, 1.0);
+        let first = FFT_SIZE * 2;
+        let last = input.len() - FFT_SIZE * 2;
+        let maximum_error = input[first..last]
+            .iter()
+            .zip(&output[first..last])
+            .map(|(input, output)| (input - output).abs())
+            .fold(0.0_f32, f32::max);
+
+        assert!(
+            maximum_error < 1e-4,
+            "unity reconstruction error is {maximum_error}"
+        );
+    }
+
+    #[test]
+    fn near_unity_speed_is_canonicalized_to_transparent_unity() {
+        let input = multi_tone(1.0);
+        let output = process_at_speed(&input, 1, 1.0 + UNITY_SPEED_EPSILON * 0.5);
+        let first = FFT_SIZE * 2;
+        let last = input.len() - FFT_SIZE * 2;
+        let maximum_error = input[first..last]
+            .iter()
+            .zip(&output[first..last])
+            .map(|(input, output)| (input - output).abs())
+            .fold(0.0_f32, f32::max);
+
+        assert!(
+            maximum_error < 1e-4,
+            "near-unity reconstruction error is {maximum_error}"
+        );
+    }
+
+    #[test]
+    fn speed_changes_do_not_collapse_the_signal_level() {
+        let input = multi_tone(6.0);
+        let mut vocoder = PhaseVocoder::new(PhaseVocoderConfig {
+            sample_rate: SAMPLE_RATE,
+            fft_size: FFT_SIZE,
+            analysis_hop: ANALYSIS_HOP,
+            channel_count: 1,
+            playback_speed: 0.75,
+        })
+        .unwrap();
+        let mut output = Vec::new();
+        for (chunk_index, chunk) in input.chunks(1024).enumerate() {
+            if chunk_index == 94 {
+                vocoder.set_playback_speed(1.35).unwrap();
+            } else if chunk_index == 188 {
+                vocoder.set_playback_speed(0.55).unwrap();
+            }
+            vocoder.process(chunk, &mut output).unwrap();
+        }
+        vocoder.flush(&mut output).unwrap();
+
+        let window = SAMPLE_RATE as usize / 50;
+        let trim = FFT_SIZE * 2;
+        let rms = output[trim..output.len() - trim]
+            .chunks_exact(window)
+            .map(|samples| {
+                (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32)
+                    .sqrt()
+            })
+            .collect::<Vec<_>>();
+        let minimum = rms.iter().copied().fold(f32::INFINITY, f32::min);
+        let mean = rms.iter().sum::<f32>() / rms.len() as f32;
+
+        assert!(
+            minimum > mean * 0.35,
+            "short-window RMS collapsed to {minimum} with mean {mean}"
+        );
     }
 
     #[test]

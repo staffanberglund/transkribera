@@ -121,13 +121,15 @@ declared runtime. The application never relies on host-installed plugins.
   hop, channel count, and initial playback speed.
 - `src/dsp/processor.rs` is the pure-DSP composition boundary. GStreamer owns a
   boxed `TempoProcessor` and cannot depend on how many phase vocoders it
-  contains or which analysis resolutions they use. The current factory creates
-  one processor at one resolution; a future multiband implementation belongs
+  contains or which analysis resolutions they use. The factory creates the
+  default single-band processor or the explicitly selected five-band processor
   behind this same interface.
 - `src/dsp/processor.rs` also supplies the default phase-vocoder analysis
   resolution and loads an optional per-user `dsp.json` override.
 - `src/dsp/filter_bank.rs` contains the isolated streaming five-band
-  complementary FIR filter bank. It is not connected to playback yet.
+  complementary FIR filter bank.
+- `src/dsp/multiband.rs` composes that filter bank with five full-rate phase
+  vocoders and enforces sample-count alignment before summing their output.
 - `src/dsp/window.rs` generates the periodic Hann window.
 - `src/dsp/gst_phase_vocoder.rs` wraps the DSP in a statically registered,
   in-process GStreamer element accepting interleaved mono or stereo F32LE PCM.
@@ -181,14 +183,21 @@ override it without rebuilding, create
 }
 ```
 
-The override is read when an audio stream is opened. This version validates
-that exactly one entry is present; the list representation is reserved for the
-future multiband implementation.
+The override is read when an audio stream is opened. Omitting `band_count`
+selects the single-band engine and requires exactly one `phase_vocoders` entry.
 The phase-vocoder unit uses a periodic Hann window and its synthesis hop is:
 
 ```text
 synthesis_hop = analysis_hop / playback_speed
 ```
+
+At unity speed it copies the analysis phases directly, making the steady-state
+STFT reconstruction transparent instead of allowing small phase-integration
+errors to accumulate. At other speeds it uses identity phase locking: spectral
+peaks follow the normal phase-vocoder trajectory, while nearby bins retain
+their analysis-frame phase relationship to the peak. This reduces the phasy
+level modulation produced when every FFT bin evolves independently. Playback
+speeds within `0.0001` of unity are treated as exact unity.
 
 Fractional hops are carried between frames so they do not accumulate a duration
 error. Exponential smoothing with a 50 ms source-time constant softens changes
@@ -233,9 +242,42 @@ full FIR tails on flush, and clears all history on reset.
 Automated tests cover impulse reconstruction, random chunked stereo
 reconstruction, output-length stability, reset, invalid configurations, and
 tone isolation. The direct-convolution implementation and full-rate band
-outputs deliberately favor a simple verifiable foundation. The filter bank is
-not yet used by `TempoProcessor`; per-band phase vocoders, output alignment,
-FIR optimization, and downsampling are later stages.
+outputs deliberately favor a simple verifiable foundation. FIR optimization
+and downsampling are later stages.
+
+### Experimental five-band tempo processor
+
+The opt-in multiband processor runs each full-rate filter-bank output through
+its own phase vocoder, checks that all five output queues contain the same
+number of interleaved samples, and only then sums them. Its reported latency is
+the FIR group delay plus the largest phase-vocoder latency. Speed changes,
+flush, and reset are forwarded to all five processors.
+
+This first integration intentionally requires identical FFT and hop settings
+for every band. To enable it for manual A/B testing at a 48 kHz input rate, use
+this `dsp.json` override:
+
+```json
+{
+  "version": 1,
+  "band_count": 5,
+  "filter_tap_count": 257,
+  "crossover_hz": [150, 600, 2400, 7000],
+  "phase_vocoders": [
+    { "fft_size": 2048, "analysis_hop": 512 },
+    { "fft_size": 2048, "analysis_hop": 512 },
+    { "fft_size": 2048, "analysis_hop": 512 },
+    { "fft_size": 2048, "analysis_hop": 512 },
+    { "fft_size": 2048, "analysis_hop": 512 }
+  ]
+}
+```
+
+Remove `band_count`, the crossover/filter fields, and four of the processor
+entries to return to the single-band engine. The five-band implementation is a
+topology and alignment milestone, not the final multiresolution engine: all
+bands still run at the source sample rate and deliberately reject differing
+analysis settings.
 
 ### GStreamer integration and time
 
