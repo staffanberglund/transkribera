@@ -4,6 +4,7 @@ use anyhow::{Result, bail};
 
 use super::{
     filter_bank::{BAND_COUNT, FiveBandFilterBank, FiveBandFilterBankConfig},
+    onset_detector::{OnsetDetector, OnsetDetectorConfig},
     phase_vocoder::{PhaseVocoder, PhaseVocoderConfig},
 };
 
@@ -33,7 +34,9 @@ pub struct FiveBandTempoProcessor {
     sample_rate: u32,
     channel_count: usize,
     filter_bank: FiveBandFilterBank,
+    onset_detector: OnsetDetector,
     phase_vocoders: Vec<PhaseVocoder>,
+    transient_events: Vec<u64>,
     band_input: [Vec<f32>; BAND_COUNT],
     processor_output: Vec<f32>,
     output_queues: [VecDeque<f32>; BAND_COUNT],
@@ -49,17 +52,39 @@ impl FiveBandTempoProcessor {
             crossover_hz: config.crossover_hz,
             tap_count: config.filter_tap_count,
         })?;
+        let detector_fft_size = config
+            .band_analysis
+            .iter()
+            .map(|analysis| analysis.fft_size)
+            .min()
+            .unwrap_or(512)
+            .min(512);
+        let detector_analysis_hop = (detector_fft_size / 8).max(1);
+        let onset_detector = OnsetDetector::new(OnsetDetectorConfig {
+            sample_rate: config.sample_rate,
+            fft_size: detector_fft_size,
+            analysis_hop: detector_analysis_hop,
+            channel_count: config.channel_count,
+        })?;
+        let output_origin_frames = config
+            .band_analysis
+            .iter()
+            .map(|analysis| analysis.fft_size / 2)
+            .max()
+            .unwrap_or(0);
         let phase_vocoders = config
             .band_analysis
             .into_iter()
             .map(|analysis| {
-                PhaseVocoder::new(PhaseVocoderConfig {
+                let mut processor = PhaseVocoder::new(PhaseVocoderConfig {
                     sample_rate: config.sample_rate,
                     fft_size: analysis.fft_size,
                     analysis_hop: analysis.analysis_hop,
                     channel_count: config.channel_count,
                     playback_speed: config.playback_speed,
-                })
+                })?;
+                processor.use_external_tempo_timeline(output_origin_frames);
+                Ok(processor)
             })
             .collect::<Result<Vec<_>>>()?;
         let phase_latency = phase_vocoders
@@ -73,7 +98,9 @@ impl FiveBandTempoProcessor {
             sample_rate: config.sample_rate,
             channel_count: config.channel_count,
             filter_bank,
+            onset_detector,
             phase_vocoders,
+            transient_events: Vec::new(),
             band_input: std::array::from_fn(|_| Vec::new()),
             processor_output: Vec::new(),
             output_queues: std::array::from_fn(|_| VecDeque::new()),
@@ -98,6 +125,13 @@ impl FiveBandTempoProcessor {
     }
 
     pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) -> Result<()> {
+        self.transient_events.clear();
+        self.onset_detector
+            .process(input, &mut self.transient_events)?;
+        let filter_delay = self.filter_bank.latency_frames() as u64;
+        for timestamp in &mut self.transient_events {
+            *timestamp = timestamp.saturating_add(filter_delay);
+        }
         for band in &mut self.band_input {
             band.clear();
         }
@@ -112,6 +146,7 @@ impl FiveBandTempoProcessor {
         if !self.has_pending_audio {
             return Ok(());
         }
+        self.transient_events.clear();
         for band in &mut self.band_input {
             band.clear();
         }
@@ -124,6 +159,7 @@ impl FiveBandTempoProcessor {
 
     pub fn reset(&mut self) {
         self.filter_bank.reset();
+        self.onset_detector.reset();
         for processor in &mut self.phase_vocoders {
             processor.reset();
         }
@@ -131,6 +167,7 @@ impl FiveBandTempoProcessor {
             band.clear();
         }
         self.processor_output.clear();
+        self.transient_events.clear();
         for queue in &mut self.output_queues {
             queue.clear();
         }
@@ -145,7 +182,11 @@ impl FiveBandTempoProcessor {
             .zip(&mut self.output_queues)
         {
             self.processor_output.clear();
-            processor.process(input, &mut self.processor_output)?;
+            processor.process_with_transients(
+                input,
+                &self.transient_events,
+                &mut self.processor_output,
+            )?;
             if flush {
                 processor.flush(&mut self.processor_output)?;
             }
@@ -190,6 +231,8 @@ impl FiveBandTempoProcessor {
 #[cfg(test)]
 mod tests {
     use std::f32::consts::TAU;
+
+    use crate::dsp::phase_vocoder::{PhaseVocoder, PhaseVocoderConfig};
 
     use super::{
         BAND_COUNT, BandAnalysisConfig, FiveBandTempoProcessor, FiveBandTempoProcessorConfig,
@@ -362,5 +405,142 @@ mod tests {
         assert_eq!(output.len() % 2, 0);
         assert!(output.iter().all(|sample| sample.is_finite()));
         assert!(processor.output_queues.iter().all(|queue| queue.is_empty()));
+    }
+
+    #[test]
+    fn different_resolutions_apply_the_same_shared_onsets() {
+        let mut heterogeneous = config(2, 0.6);
+        heterogeneous.band_analysis = [
+            BandAnalysisConfig {
+                fft_size: 512,
+                analysis_hop: 64,
+            },
+            BandAnalysisConfig {
+                fft_size: 256,
+                analysis_hop: 32,
+            },
+            BandAnalysisConfig {
+                fft_size: 128,
+                analysis_hop: 16,
+            },
+            BandAnalysisConfig {
+                fft_size: 64,
+                analysis_hop: 8,
+            },
+            BandAnalysisConfig {
+                fft_size: 32,
+                analysis_hop: 4,
+            },
+        ];
+        let mut input = vec![0.0; SAMPLE_RATE as usize * 2];
+        for frame in [2_000, 5_000] {
+            for age in 0_usize..64 {
+                let sample = if age.is_multiple_of(2) { 0.8 } else { -0.8 };
+                input[(frame + age) * 2] = sample;
+                input[(frame + age) * 2 + 1] = sample;
+            }
+        }
+        let mut processor = FiveBandTempoProcessor::new(heterogeneous).unwrap();
+        let mut output = Vec::new();
+        for chunk in input.chunks(146) {
+            processor.process(chunk, &mut output).unwrap();
+        }
+        processor.flush(&mut output).unwrap();
+        let detections = processor
+            .phase_vocoders
+            .iter()
+            .map(|vocoder| vocoder.detected_transients())
+            .collect::<Vec<_>>();
+
+        assert!(detections[0] >= 2, "shared detections: {detections:?}");
+        assert!(detections.iter().all(|count| *count == detections[0]));
+    }
+
+    #[test]
+    fn shared_tempo_timeline_aligns_impulses_across_resolutions() {
+        let analyses = [
+            BandAnalysisConfig {
+                fft_size: 512,
+                analysis_hop: 64,
+            },
+            BandAnalysisConfig {
+                fft_size: 256,
+                analysis_hop: 32,
+            },
+            BandAnalysisConfig {
+                fft_size: 128,
+                analysis_hop: 16,
+            },
+            BandAnalysisConfig {
+                fft_size: 64,
+                analysis_hop: 8,
+            },
+            BandAnalysisConfig {
+                fft_size: 32,
+                analysis_hop: 4,
+            },
+        ];
+        for speed in [0.5, 0.75, 1.0, 1.5] {
+            let positions = impulse_positions(analyses, speed, None);
+            let spread = positions.iter().max().unwrap() - positions.iter().min().unwrap();
+            assert!(spread <= 16, "{speed}x impulse positions: {positions:?}");
+        }
+
+        let positions = impulse_positions(analyses, 1.0, Some((1_000, 0.5)));
+        let spread = positions.iter().max().unwrap() - positions.iter().min().unwrap();
+        assert!(
+            spread <= 16,
+            "speed-transition impulse positions: {positions:?}"
+        );
+    }
+
+    fn impulse_positions(
+        analyses: [BandAnalysisConfig; BAND_COUNT],
+        initial_speed: f32,
+        speed_change: Option<(usize, f32)>,
+    ) -> Vec<usize> {
+        let input_frames = 8_000;
+        let impulse_frame = 2_000_u64;
+        analyses
+            .into_iter()
+            .map(|analysis| {
+                let mut processor = PhaseVocoder::new(PhaseVocoderConfig {
+                    sample_rate: SAMPLE_RATE,
+                    fft_size: analysis.fft_size,
+                    analysis_hop: analysis.analysis_hop,
+                    channel_count: 1,
+                    playback_speed: initial_speed,
+                })
+                .unwrap();
+                processor.use_external_tempo_timeline(256);
+                let mut input = vec![0.0; input_frames];
+                input[impulse_frame as usize] = 1.0;
+                let mut output = Vec::new();
+                if let Some((change_frame, speed)) = speed_change {
+                    processor
+                        .process_with_transients(&input[..change_frame], &[], &mut output)
+                        .unwrap();
+                    processor.set_playback_speed(speed).unwrap();
+                    processor
+                        .process_with_transients(
+                            &input[change_frame..],
+                            &[impulse_frame],
+                            &mut output,
+                        )
+                        .unwrap();
+                } else {
+                    processor
+                        .process_with_transients(&input, &[impulse_frame], &mut output)
+                        .unwrap();
+                }
+                processor.flush(&mut output).unwrap();
+                output
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, left), (_, right)| left.abs().total_cmp(&right.abs()))
+                    .map(|(index, _)| index)
+                    .unwrap()
+            })
+            .collect()
     }
 }

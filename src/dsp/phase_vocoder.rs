@@ -107,6 +107,12 @@ pub struct PhaseVocoder {
     source_frames_since_transient: usize,
     transient_retrigger_frames: usize,
     detected_transients: u64,
+    external_transient_timeline: bool,
+    pending_external_transients: VecDeque<u64>,
+    last_external_transient: Option<u64>,
+    external_tempo_origin_frames: Option<usize>,
+    speed_events: Vec<(u64, f32)>,
+    input_frames_received: u64,
     pending_real_frames: usize,
     processed_frames: u64,
 }
@@ -157,6 +163,12 @@ impl PhaseVocoder {
             transient_retrigger_frames: (sample_rate as f32 * TRANSIENT_RETRIGGER_SECONDS).ceil()
                 as usize,
             detected_transients: 0,
+            external_transient_timeline: false,
+            pending_external_transients: VecDeque::new(),
+            last_external_transient: None,
+            external_tempo_origin_frames: None,
+            speed_events: vec![(0, canonical_playback_speed(playback_speed))],
+            input_frames_received: 0,
             pending_real_frames: 0,
             processed_frames: 0,
         })
@@ -170,14 +182,82 @@ impl PhaseVocoder {
         self.fft_size - self.analysis_hop
     }
 
+    #[cfg(test)]
+    pub(crate) fn detected_transients(&self) -> u64 {
+        self.detected_transients
+    }
+
     pub fn set_playback_speed(&mut self, playback_speed: f32) -> Result<()> {
         validate_playback_speed(playback_speed)?;
         let playback_speed = canonical_playback_speed(playback_speed);
         self.target_playback_speed = playback_speed;
+        if self.external_tempo_origin_frames.is_some()
+            && self
+                .speed_events
+                .last()
+                .is_none_or(|(_, speed)| *speed != playback_speed)
+        {
+            if self
+                .speed_events
+                .last()
+                .is_some_and(|(frame, _)| *frame == self.input_frames_received)
+            {
+                if let Some((_, speed)) = self.speed_events.last_mut() {
+                    *speed = playback_speed;
+                }
+            } else {
+                self.speed_events
+                    .push((self.input_frames_received, playback_speed));
+            }
+        }
         if self.processed_frames == 0 {
             self.current_playback_speed = playback_speed;
         }
         Ok(())
+    }
+
+    pub fn use_external_transient_timeline(&mut self) {
+        self.external_transient_timeline = true;
+        self.pending_external_transients.clear();
+        self.last_external_transient = None;
+    }
+
+    pub fn use_external_tempo_timeline(&mut self, output_origin_frames: usize) {
+        self.use_external_transient_timeline();
+        self.external_tempo_origin_frames = Some(output_origin_frames);
+        self.speed_events.clear();
+        self.speed_events.push((0, self.current_playback_speed));
+        self.input_frames_received = 0;
+    }
+
+    pub fn process_with_transients(
+        &mut self,
+        input: &[f32],
+        transient_source_frames: &[u64],
+        output: &mut Vec<f32>,
+    ) -> Result<()> {
+        if !self.external_transient_timeline {
+            bail!("external transient timeline has not been enabled");
+        }
+        if transient_source_frames
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            bail!("external transient timestamps must be strictly increasing");
+        }
+        if let (Some(previous), Some(next)) = (
+            self.last_external_transient,
+            transient_source_frames.first(),
+        ) && *next <= previous
+        {
+            bail!("external transient timestamps must remain increasing across buffers");
+        }
+        if let Some(last) = transient_source_frames.last() {
+            self.last_external_transient = Some(*last);
+        }
+        self.pending_external_transients
+            .extend(transient_source_frames.iter().copied());
+        self.process(input, output)
     }
 
     pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) -> Result<()> {
@@ -186,6 +266,7 @@ impl PhaseVocoder {
         }
 
         let frames = input.len() / self.channel_count;
+        self.input_frames_received = self.input_frames_received.saturating_add(frames as u64);
         self.pending_real_frames = self.pending_real_frames.saturating_add(frames);
         for frame in input.chunks_exact(self.channel_count) {
             for (channel, sample) in self.channel_state.iter_mut().zip(frame) {
@@ -220,6 +301,11 @@ impl PhaseVocoder {
         self.synthesis_hop_fraction = 0.0;
         self.source_frames_since_transient = usize::MAX;
         self.detected_transients = 0;
+        self.pending_external_transients.clear();
+        self.last_external_transient = None;
+        self.speed_events.clear();
+        self.speed_events.push((0, self.target_playback_speed));
+        self.input_frames_received = 0;
         self.pending_real_frames = 0;
         self.processed_frames = 0;
     }
@@ -235,7 +321,7 @@ impl PhaseVocoder {
     }
 
     fn process_frame(&mut self, output: &mut Vec<f32>) {
-        if self.processed_frames > 0 {
+        if self.external_tempo_origin_frames.is_none() && self.processed_frames > 0 {
             self.current_playback_speed += (self.target_playback_speed
                 - self.current_playback_speed)
                 * self.speed_smoothing_coefficient;
@@ -244,10 +330,27 @@ impl PhaseVocoder {
             }
         }
 
-        let synthesis_hop_exact = self.analysis_hop as f32 / self.current_playback_speed;
-        let synthesis_hop_with_fraction = synthesis_hop_exact + self.synthesis_hop_fraction;
-        let synthesis_hop = synthesis_hop_with_fraction.floor().max(1.0) as usize;
-        self.synthesis_hop_fraction = synthesis_hop_with_fraction - synthesis_hop as f32;
+        let synthesis_hop = if let Some(origin) = self.external_tempo_origin_frames {
+            let analysis_center = self.processed_frames as f64 * self.analysis_hop as f64
+                + self.fft_size as f64 / 2.0;
+            let current_start =
+                origin as f64 + self.map_source_frame(analysis_center) - self.fft_size as f64 / 2.0;
+            let next_start = origin as f64
+                + self.map_source_frame(analysis_center + self.analysis_hop as f64)
+                - self.fft_size as f64 / 2.0;
+            if self.processed_frames == 0 {
+                self.emit_output(current_start.round().max(0.0) as usize, output);
+            }
+            let exact_hop = (next_start - current_start).max(1.0);
+            self.current_playback_speed = self.analysis_hop as f32 / exact_hop as f32;
+            (next_start.round() - current_start.round()).max(1.0) as usize
+        } else {
+            let synthesis_hop_exact = self.analysis_hop as f32 / self.current_playback_speed;
+            let synthesis_hop_with_fraction = synthesis_hop_exact + self.synthesis_hop_fraction;
+            let synthesis_hop = synthesis_hop_with_fraction.floor().max(1.0) as usize;
+            self.synthesis_hop_fraction = synthesis_hop_with_fraction - synthesis_hop as f32;
+            synthesis_hop
+        };
         let transparent_unity = self.current_playback_speed == 1.0
             && self.target_playback_speed == 1.0
             && synthesis_hop == self.analysis_hop;
@@ -272,8 +375,10 @@ impl PhaseVocoder {
                 let input_bin = channel.spectrum[bin];
                 let phase = input_bin.arg();
                 channel.magnitude[bin] = input_bin.norm();
-                current_magnitude_sum += channel.magnitude[bin];
-                if channel.phase_initialized {
+                if !self.external_transient_timeline {
+                    current_magnitude_sum += channel.magnitude[bin];
+                }
+                if !self.external_transient_timeline && channel.phase_initialized {
                     positive_spectral_flux +=
                         (channel.magnitude[bin] - channel.previous_magnitude[bin]).max(0.0);
                 }
@@ -292,22 +397,28 @@ impl PhaseVocoder {
                 }
                 channel.previous_phase[bin] = phase;
             }
-            channel
-                .previous_magnitude
-                .copy_from_slice(&channel.magnitude);
-            let mean_magnitude = current_magnitude_sum / bins as f32;
-            if channel.phase_initialized && mean_magnitude >= TRANSIENT_MIN_MEAN_MAGNITUDE {
-                strongest_channel_flux = strongest_channel_flux
-                    .max(positive_spectral_flux / current_magnitude_sum.max(f32::EPSILON));
+            if !self.external_transient_timeline {
+                channel
+                    .previous_magnitude
+                    .copy_from_slice(&channel.magnitude);
+                let mean_magnitude = current_magnitude_sum / bins as f32;
+                if channel.phase_initialized && mean_magnitude >= TRANSIENT_MIN_MEAN_MAGNITUDE {
+                    strongest_channel_flux = strongest_channel_flux
+                        .max(positive_spectral_flux / current_magnitude_sum.max(f32::EPSILON));
+                }
             }
         }
 
-        self.source_frames_since_transient = self
-            .source_frames_since_transient
-            .saturating_add(self.analysis_hop);
-        let transient = !transparent_unity
-            && strongest_channel_flux >= TRANSIENT_FLUX_THRESHOLD
-            && self.source_frames_since_transient >= self.transient_retrigger_frames;
+        let transient_detected = if self.external_transient_timeline {
+            self.take_external_transient_for_current_frame()
+        } else {
+            self.source_frames_since_transient = self
+                .source_frames_since_transient
+                .saturating_add(self.analysis_hop);
+            strongest_channel_flux >= TRANSIENT_FLUX_THRESHOLD
+                && self.source_frames_since_transient >= self.transient_retrigger_frames
+        };
+        let transient = transient_detected && !transparent_unity;
         if transient {
             self.source_frames_since_transient = 0;
             self.detected_transients += 1;
@@ -358,6 +469,40 @@ impl PhaseVocoder {
         self.pending_real_frames = self.pending_real_frames.saturating_sub(self.analysis_hop);
         self.processed_frames += 1;
         self.emit_output(synthesis_hop, output);
+    }
+
+    fn take_external_transient_for_current_frame(&mut self) -> bool {
+        let frame_start = self
+            .processed_frames
+            .saturating_mul(self.analysis_hop as u64);
+        let frame_center = frame_start.saturating_add(self.fft_size as u64 / 2);
+        let right_boundary = frame_center.saturating_add(self.analysis_hop as u64 / 2);
+        let mut transient = false;
+        while self
+            .pending_external_transients
+            .front()
+            .is_some_and(|timestamp| *timestamp <= right_boundary)
+        {
+            self.pending_external_transients.pop_front();
+            transient = true;
+        }
+        transient
+    }
+
+    fn map_source_frame(&self, source_frame: f64) -> f64 {
+        let mut output_frame = 0.0;
+        let mut segment_start = 0.0;
+        let mut speed = self.speed_events[0].1 as f64;
+        for &(event_frame, event_speed) in self.speed_events.iter().skip(1) {
+            let event_frame = event_frame as f64;
+            if event_frame >= source_frame {
+                break;
+            }
+            output_frame += (event_frame - segment_start) / speed;
+            segment_start = event_frame;
+            speed = event_speed as f64;
+        }
+        output_frame + (source_frame - segment_start) / speed
     }
 
     fn emit_output(&mut self, frames: usize, output: &mut Vec<f32>) {
@@ -733,6 +878,28 @@ mod tests {
             "steady tone caused {} transient resets",
             vocoder.detected_transients
         );
+    }
+
+    #[test]
+    fn external_transient_timestamps_drive_phase_resets() {
+        let input = vec![0.0; SAMPLE_RATE as usize / 10];
+        let mut vocoder = PhaseVocoder::new(PhaseVocoderConfig {
+            sample_rate: SAMPLE_RATE,
+            fft_size: 256,
+            analysis_hop: 64,
+            channel_count: 1,
+            playback_speed: 0.6,
+        })
+        .unwrap();
+        vocoder.use_external_transient_timeline();
+        let mut output = Vec::new();
+        vocoder
+            .process_with_transients(&input, &[500, 2_000], &mut output)
+            .unwrap();
+        vocoder.flush(&mut output).unwrap();
+
+        assert_eq!(vocoder.detected_transients(), 2);
+        assert!(vocoder.pending_external_transients.is_empty());
     }
 
     #[test]

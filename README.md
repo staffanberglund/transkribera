@@ -130,6 +130,8 @@ declared runtime. The application never relies on host-installed plugins.
   complementary FIR filter bank.
 - `src/dsp/multiband.rs` composes that filter bank with five full-rate phase
   vocoders and enforces sample-count alignment before summing their output.
+- `src/dsp/onset_detector.rs` timestamps attacks once on the original full-band
+  signal so different analysis resolutions follow one transient timeline.
 - `src/dsp/window.rs` generates the periodic Hann window.
 - `src/dsp/gst_phase_vocoder.rs` wraps the DSP in a statically registered,
   in-process GStreamer element accepting interleaved mono or stereo F32LE PCM.
@@ -205,6 +207,19 @@ synthesis phases for both stereo channels on the same analysis frame, reducing
 the pre-echo and phase smearing of transients without moving the stereo image.
 The detector has a 30 ms source-time retrigger interval; steady tonal frames
 continue through identity phase locking without resets.
+
+The single-band engine performs that detection internally. The five-band
+engine instead runs one short-window detector on the original full-band signal,
+adds the filter-bank group delay to each source-frame timestamp, and supplies
+the resulting ordered event timeline to all five phase vocoders. This prevents
+the different FFT resolutions from independently placing the same attack on
+different detected onsets.
+
+The five-band engine also gives every resolution one shared source-to-output
+tempo map. Each synthesis window is placed according to its analysis-window
+center on that absolute map, and integer hops are derived from rounded absolute
+positions rather than accumulated independently. This keeps broadband events
+aligned across FFT sizes at fixed speeds and across live speed changes.
 
 Fractional hops are carried between frames so they do not accumulate a duration
 error. Exponential smoothing with a 50 ms source-time constant softens changes
