@@ -15,6 +15,12 @@ const SPEED_SMOOTHING_TIME_SECONDS: f32 = 0.050;
 // Values this close to unity are canonicalized so the transparent phase path
 // cannot be missed because of slider or property conversion roundoff.
 const UNITY_SPEED_EPSILON: f32 = 1e-4;
+// Positive spectral flux is normalized by the current frame magnitude. A
+// fairly conservative threshold avoids treating normal vibrato/noise movement
+// as a new attack.
+const TRANSIENT_FLUX_THRESHOLD: f32 = 0.40;
+const TRANSIENT_MIN_MEAN_MAGNITUDE: f32 = 1e-5;
+const TRANSIENT_RETRIGGER_SECONDS: f32 = 0.030;
 // Avoid amplifying FFT roundoff at the nearly-zero edges of the final window.
 const NORMALIZATION_EPSILON: f32 = 1e-4;
 
@@ -35,6 +41,7 @@ struct ChannelState {
     analysis_phase: Vec<f32>,
     propagated_phase: Vec<f32>,
     spectral_peaks: Vec<usize>,
+    previous_magnitude: Vec<f32>,
     previous_phase: Vec<f32>,
     synthesis_phase: Vec<f32>,
     overlap: VecDeque<f32>,
@@ -52,6 +59,7 @@ impl ChannelState {
             analysis_phase: vec![0.0; bins],
             propagated_phase: vec![0.0; bins],
             spectral_peaks: Vec::with_capacity(bins),
+            previous_magnitude: vec![0.0; bins],
             previous_phase: vec![0.0; bins],
             synthesis_phase: vec![0.0; bins],
             overlap: VecDeque::from(vec![0.0; fft_size]),
@@ -67,6 +75,7 @@ impl ChannelState {
         self.analysis_phase.fill(0.0);
         self.propagated_phase.fill(0.0);
         self.spectral_peaks.clear();
+        self.previous_magnitude.fill(0.0);
         self.previous_phase.fill(0.0);
         self.synthesis_phase.fill(0.0);
         self.overlap.clear();
@@ -95,6 +104,9 @@ pub struct PhaseVocoder {
     current_playback_speed: f32,
     speed_smoothing_coefficient: f32,
     synthesis_hop_fraction: f32,
+    source_frames_since_transient: usize,
+    transient_retrigger_frames: usize,
+    detected_transients: u64,
     pending_real_frames: usize,
     processed_frames: u64,
 }
@@ -141,6 +153,10 @@ impl PhaseVocoder {
             current_playback_speed: canonical_playback_speed(playback_speed),
             speed_smoothing_coefficient: speed_smoothing_coefficient(sample_rate, analysis_hop),
             synthesis_hop_fraction: 0.0,
+            source_frames_since_transient: usize::MAX,
+            transient_retrigger_frames: (sample_rate as f32 * TRANSIENT_RETRIGGER_SECONDS).ceil()
+                as usize,
+            detected_transients: 0,
             pending_real_frames: 0,
             processed_frames: 0,
         })
@@ -202,6 +218,8 @@ impl PhaseVocoder {
         }
         self.current_playback_speed = self.target_playback_speed;
         self.synthesis_hop_fraction = 0.0;
+        self.source_frames_since_transient = usize::MAX;
+        self.detected_transients = 0;
         self.pending_real_frames = 0;
         self.processed_frames = 0;
     }
@@ -233,8 +251,12 @@ impl PhaseVocoder {
         let transparent_unity = self.current_playback_speed == 1.0
             && self.target_playback_speed == 1.0
             && synthesis_hop == self.analysis_hop;
+        let bins = self.fft_size / 2 + 1;
 
+        let mut strongest_channel_flux = 0.0_f32;
         for channel in &mut self.channel_state {
+            let mut positive_spectral_flux = 0.0;
+            let mut current_magnitude_sum = 0.0;
             for (index, (sample, window)) in channel
                 .input
                 .iter()
@@ -246,11 +268,15 @@ impl PhaseVocoder {
             }
             self.forward_fft.process(&mut channel.spectrum);
 
-            let bins = self.fft_size / 2 + 1;
             for bin in 0..bins {
                 let input_bin = channel.spectrum[bin];
                 let phase = input_bin.arg();
                 channel.magnitude[bin] = input_bin.norm();
+                current_magnitude_sum += channel.magnitude[bin];
+                if channel.phase_initialized {
+                    positive_spectral_flux +=
+                        (channel.magnitude[bin] - channel.previous_magnitude[bin]).max(0.0);
+                }
                 channel.analysis_phase[bin] = phase;
                 if channel.phase_initialized {
                     let expected_phase_advance =
@@ -266,8 +292,29 @@ impl PhaseVocoder {
                 }
                 channel.previous_phase[bin] = phase;
             }
+            channel
+                .previous_magnitude
+                .copy_from_slice(&channel.magnitude);
+            let mean_magnitude = current_magnitude_sum / bins as f32;
+            if channel.phase_initialized && mean_magnitude >= TRANSIENT_MIN_MEAN_MAGNITUDE {
+                strongest_channel_flux = strongest_channel_flux
+                    .max(positive_spectral_flux / current_magnitude_sum.max(f32::EPSILON));
+            }
+        }
 
-            if transparent_unity || !channel.phase_initialized {
+        self.source_frames_since_transient = self
+            .source_frames_since_transient
+            .saturating_add(self.analysis_hop);
+        let transient = !transparent_unity
+            && strongest_channel_flux >= TRANSIENT_FLUX_THRESHOLD
+            && self.source_frames_since_transient >= self.transient_retrigger_frames;
+        if transient {
+            self.source_frames_since_transient = 0;
+            self.detected_transients += 1;
+        }
+
+        for channel in &mut self.channel_state {
+            if transparent_unity || transient || !channel.phase_initialized {
                 channel
                     .propagated_phase
                     .copy_from_slice(&channel.analysis_phase);
@@ -450,6 +497,26 @@ mod tests {
             .collect()
     }
 
+    fn separated_attacks(channels: usize) -> Vec<f32> {
+        let frames = SAMPLE_RATE as usize * 2;
+        let attack_frames = [SAMPLE_RATE as usize / 2, SAMPLE_RATE as usize];
+        let mut samples = Vec::with_capacity(frames * channels);
+        for frame in 0..frames {
+            let sample = attack_frames
+                .iter()
+                .filter_map(|attack| frame.checked_sub(*attack))
+                .filter(|age| *age < SAMPLE_RATE as usize / 10)
+                .map(|age| {
+                    let envelope = (-(age as f32) / (SAMPLE_RATE as f32 * 0.015)).exp();
+                    let tone = (TAU * 1_700.0 * age as f32 / SAMPLE_RATE as f32).sin();
+                    envelope * tone * 0.6
+                })
+                .sum::<f32>();
+            samples.extend(std::iter::repeat_n(sample, channels));
+        }
+        samples
+    }
+
     fn process_at_speed(input: &[f32], channels: usize, speed: f32) -> Vec<f32> {
         let mut vocoder = PhaseVocoder::new(PhaseVocoderConfig {
             sample_rate: SAMPLE_RATE,
@@ -618,6 +685,53 @@ mod tests {
         assert!(
             minimum > mean * 0.35,
             "short-window RMS collapsed to {minimum} with mean {mean}"
+        );
+    }
+
+    #[test]
+    fn separated_attacks_trigger_coherent_phase_resets() {
+        let input = separated_attacks(2);
+        let mut vocoder = PhaseVocoder::new(PhaseVocoderConfig {
+            sample_rate: SAMPLE_RATE,
+            fft_size: FFT_SIZE,
+            analysis_hop: ANALYSIS_HOP,
+            channel_count: 2,
+            playback_speed: 0.6,
+        })
+        .unwrap();
+        let mut output = Vec::new();
+        for chunk in input.chunks(1024) {
+            vocoder.process(chunk, &mut output).unwrap();
+        }
+        vocoder.flush(&mut output).unwrap();
+
+        assert!(
+            (2..=4).contains(&vocoder.detected_transients),
+            "expected two attacks without rapid retriggering, detected {}",
+            vocoder.detected_transients
+        );
+        assert!(output.chunks_exact(2).all(|frame| frame[0] == frame[1]));
+    }
+
+    #[test]
+    fn steady_tone_does_not_repeatedly_trigger_transient_resets() {
+        let input = sine_wave(440.0, 2.0, 1);
+        let mut vocoder = PhaseVocoder::new(PhaseVocoderConfig {
+            sample_rate: SAMPLE_RATE,
+            fft_size: FFT_SIZE,
+            analysis_hop: ANALYSIS_HOP,
+            channel_count: 1,
+            playback_speed: 0.6,
+        })
+        .unwrap();
+        let mut output = Vec::new();
+        vocoder.process(&input, &mut output).unwrap();
+        vocoder.flush(&mut output).unwrap();
+
+        assert!(
+            vocoder.detected_transients <= 1,
+            "steady tone caused {} transient resets",
+            vocoder.detected_transients
         );
     }
 

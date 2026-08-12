@@ -199,6 +199,13 @@ their analysis-frame phase relationship to the peak. This reduces the phasy
 level modulation produced when every FFT bin evolves independently. Playback
 speeds within `0.0001` of unity are treated as exact unity.
 
+At non-unity speeds, a normalized positive-spectral-flux detector identifies
+new attacks independently in either input channel. A detected onset resets the
+synthesis phases for both stereo channels on the same analysis frame, reducing
+the pre-echo and phase smearing of transients without moving the stereo image.
+The detector has a 30 ms source-time retrigger interval; steady tonal frames
+continue through identity phase locking without resets.
+
 Fractional hops are carried between frames so they do not accumulate a duration
 error. Exponential smoothing with a 50 ms source-time constant softens changes
 made after processing has started. Its per-frame coefficient is derived from
