@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.staffanberglund.transkribera</id>
+  <name>Transkribera</name>
+  <summary>Transcribe audio with precise playback and waveform controls</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.github.staffanberglund">
+    <name>Staffan Berglund</name>
+  </developer>
+  <url type="homepage">https://github.com/staffanberglund/transkribera</url>
+  <url type="bugtracker">https://github.com/staffanberglund/transkribera/issues</url>
+  <description>
+    <p>
+      Transkribera is an audio player designed for close listening and transcription.
+      It provides a detailed zoomable waveform, precise seeking, markers, keyboard
+      controls, and pitch-preserving variable-speed playback.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.staffanberglund.transkribera.desktop</launchable>
+  <provides>
+    <binary>transkribera</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0-alpha.1" date="2026-08-12" type="development">
+      <description>
+        <p>First alpha release of Transkribera.</p>
+      </description>
+    </release>
+  </releases>
+</component>

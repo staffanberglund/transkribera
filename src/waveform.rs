@@ -225,7 +225,7 @@ mod tests {
         gst::init().context("could not initialize GStreamer for the test")?;
 
         let path = std::env::temp_dir().join(format!(
-            "transcription-mvp-waveform-test-{}.wav",
+            "transkribera-waveform-test-{}.wav",
             std::process::id()
         ));
         fs::write(&path, sine_wave_wav()).context("could not write the test wave file")?;

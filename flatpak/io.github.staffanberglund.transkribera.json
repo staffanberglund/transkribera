@@ -1,12 +1,12 @@
 {
-  "app-id": "io.github.example.TranscriptionMvp",
+  "app-id": "io.github.staffanberglund.transkribera",
   "runtime": "org.gnome.Platform",
   "runtime-version": "49",
   "sdk": "org.gnome.Sdk",
   "sdk-extensions": [
     "org.freedesktop.Sdk.Extension.rust-stable"
   ],
-  "command": "transcription-mvp",
+  "command": "transkribera",
   "finish-args": [
     "--share=ipc",
     "--socket=fallback-x11",
@@ -22,14 +22,14 @@
   },
   "modules": [
     {
-      "name": "transcription-mvp",
+      "name": "transkribera",
       "buildsystem": "simple",
       "build-commands": [
         "cargo build --release --locked --offline",
-        "install -Dm755 target/release/transcription-mvp /app/bin/transcription-mvp",
-        "install -Dm644 data/io.github.example.TranscriptionMvp.desktop /app/share/applications/io.github.example.TranscriptionMvp.desktop",
-        "install -Dm644 data/io.github.example.TranscriptionMvp.metainfo.xml /app/share/metainfo/io.github.example.TranscriptionMvp.metainfo.xml",
-        "install -Dm644 data/icons/io.github.example.TranscriptionMvp.svg /app/share/icons/hicolor/scalable/apps/io.github.example.TranscriptionMvp.svg"
+        "install -Dm755 target/release/transkribera /app/bin/transkribera",
+        "install -Dm644 data/io.github.staffanberglund.transkribera.desktop /app/share/applications/io.github.staffanberglund.transkribera.desktop",
+        "install -Dm644 data/io.github.staffanberglund.transkribera.metainfo.xml /app/share/metainfo/io.github.staffanberglund.transkribera.metainfo.xml",
+        "install -Dm644 data/icons/io.github.staffanberglund.transkribera.svg /app/share/icons/hicolor/scalable/apps/io.github.staffanberglund.transkribera.svg"
       ],
       "sources": [
         {
@@ -45,4 +45,3 @@
     }
   ]
 }
-

@@ -1,6 +1,6 @@
 [package]
-name = "transcription-mvp"
-version = "0.1.0"
+name = "transkribera"
+version = "0.1.0-alpha.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "A minimal desktop audio player with a waveform for transcription work"
@@ -21,5 +21,5 @@ strip = true
 # The development Flatpak is used for real-time listening tests. Optimize the
 # application DSP without imposing optimized rebuilds on the GTK/GStreamer
 # dependency graph, so subsequent edit/build cycles remain quick.
-[profile.dev.package.transcription-mvp]
+[profile.dev.package.transkribera]
 opt-level = 3

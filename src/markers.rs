@@ -26,7 +26,7 @@ impl MarkerStore {
         let audio_path = identity.to_string_lossy().into_owned();
         let hash = stable_hash(audio_path.as_bytes());
         let path = glib::user_data_dir()
-            .join("transcription-mvp")
+            .join("transkribera")
             .join("markers")
             .join(format!("{hash:016x}.json"));
         Self { path, audio_path }

@@ -335,7 +335,7 @@ mod imp {
 
     #[glib::object_subclass]
     impl ObjectSubclass for GstPhaseVocoder {
-        const NAME: &'static str = "TranscriptionMvpPhaseVocoder";
+        const NAME: &'static str = "TranskriberaPhaseVocoder";
         type Type = super::GstPhaseVocoder;
         type ParentType = gst::Element;
 
@@ -470,7 +470,7 @@ mod imp {
                     "Rust phase vocoder",
                     "Filter/Effect/Audio",
                     "Changes audio tempo while preserving pitch",
-                    "Transcription MVP contributors",
+                    "Staffan Berglund and Transkribera contributors",
                 )
             }))
         }

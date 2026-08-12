@@ -19,7 +19,7 @@ impl RecentStore {
     pub fn new() -> Self {
         Self {
             path: glib::user_data_dir()
-                .join("transcription-mvp")
+                .join("transkribera")
                 .join("recent.json"),
         }
     }

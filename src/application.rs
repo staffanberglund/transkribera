@@ -15,7 +15,7 @@ use crate::{
     waveform::WaveformJob,
 };
 
-const APP_ID: &str = "io.github.example.TranscriptionMvp";
+const APP_ID: &str = "io.github.staffanberglund.transkribera";
 const UPDATE_INTERVAL_MS: u64 = 150;
 const MIN_WAVEFORM_ZOOM: f64 = 1.0;
 const MAX_WAVEFORM_ZOOM: f64 = 100.0;
@@ -91,7 +91,7 @@ fn build_ui(application: &gtk::Application) {
 
     let window = gtk::ApplicationWindow::builder()
         .application(application)
-        .title("Transcription MVP")
+        .title("Transkribera")
         .default_width(720)
         .default_height(460)
         .width_request(360)
@@ -1715,7 +1715,7 @@ fn show_error(parent: &impl IsA<gtk::Window>, title: &str, details: &str) {
 fn show_startup_error(application: &gtk::Application, details: &str) {
     let window = gtk::ApplicationWindow::builder()
         .application(application)
-        .title("Transcription MVP")
+        .title("Transkribera")
         .default_width(420)
         .default_height(120)
         .build();

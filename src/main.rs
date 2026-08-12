@@ -13,7 +13,7 @@ fn main() {
     env_logger::init();
 
     if let Err(error) = run() {
-        eprintln!("Failed to start Transcription MVP: {error:#}");
+        eprintln!("Failed to start Transkribera: {error:#}");
         std::process::exit(1);
     }
 }

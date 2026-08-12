@@ -1,6 +1,6 @@
-# Transcription MVP
+# Transkribera
 
-Transcription MVP is a minimal GTK 4 desktop audio player intended as a small,
+Transkribera is a GTK 4 desktop audio player intended as a small,
 maintainable foundation for transcription work. It uses GStreamer for both
 playback and waveform decoding and deliberately omits editing and advanced
 playback features.
@@ -74,8 +74,8 @@ flatpak install --user flathub org.gnome.Platform//49 org.gnome.Sdk//49 \
 Build, install, and run from the repository root:
 
 ```bash
-flatpak-builder --user --install --force-clean build-dir flatpak/io.github.example.TranscriptionMvp.json
-flatpak run --user io.github.example.TranscriptionMvp
+flatpak-builder --user --install --force-clean build-dir flatpak/io.github.staffanberglund.transkribera.json
+flatpak run --user io.github.staffanberglund.transkribera
 ```
 
 For faster development cycles, use the incremental debug build script:
@@ -169,9 +169,9 @@ audio is not mixed with direct audio.
 
 The in-code default uses a 2,048-sample FFT and a 512-sample analysis hop. To
 override it without rebuilding, create
-`$XDG_CONFIG_HOME/transcription-mvp/dsp.json` (normally
-`~/.config/transcription-mvp/dsp.json`; inside Flatpak it is stored below
-`~/.var/app/io.github.example.TranscriptionMvp/config/`) with this structure:
+`$XDG_CONFIG_HOME/transkribera/dsp.json` (normally
+`~/.config/transkribera/dsp.json`; inside Flatpak it is stored below
+`~/.var/app/io.github.staffanberglund.transkribera/config/`) with this structure:
 
 ```json
 {
@@ -333,9 +333,9 @@ pads and processes the final partial frame, emits the remaining overlap-add
 tail, and then forwards EOS.
 
 Marker files are stored under
-`$XDG_DATA_HOME/transcription-mvp/markers/` when running natively. The Flatpak
+`$XDG_DATA_HOME/transkribera/markers/` when running natively. The Flatpak
 location is normally
-`~/.var/app/io.github.example.TranscriptionMvp/data/transcription-mvp/markers/`.
+`~/.var/app/io.github.staffanberglund.transkribera/data/transkribera/markers/`.
 Each JSON file records the source path plus marker names and positions in
 nanoseconds. Application settings are stored in `settings.json` one directory
 above the marker files, with recent paths in `recent.json` beside it.
@@ -392,12 +392,12 @@ runtime is installed with `flatpak info org.gnome.Platform//49`, update it with
 `flatpak update`, and inspect the sandbox copy of a plugin with:
 
 ```bash
-flatpak run --command=gst-inspect-1.0 io.github.example.TranscriptionMvp opusdec
+flatpak run --command=gst-inspect-1.0 io.github.staffanberglund.transkribera opusdec
 ```
 
 If the chooser opens but the app cannot access a selected file, ensure a desktop
 portal and an appropriate backend are running, then inspect permissions with
-`flatpak info --show-permissions io.github.example.TranscriptionMvp`.
+`flatpak info --show-permissions io.github.staffanberglund.transkribera`.
 
 ## License
 

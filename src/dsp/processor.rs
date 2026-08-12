@@ -16,7 +16,7 @@ pub const MIN_PLAYBACK_SPEED: f32 = 0.25;
 pub const MAX_PLAYBACK_SPEED: f32 = 1.50;
 
 const DSP_CONFIG_VERSION: u64 = 1;
-const DSP_CONFIG_DIRECTORY: &str = "transcription-mvp";
+const DSP_CONFIG_DIRECTORY: &str = "transkribera";
 const DSP_CONFIG_FILENAME: &str = "dsp.json";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

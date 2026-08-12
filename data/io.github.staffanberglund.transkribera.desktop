@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Transcription MVP
+Name=Transkribera
 Comment=Play audio and view its waveform
-Exec=transcription-mvp
-Icon=io.github.example.TranscriptionMvp
+Exec=transkribera
+Icon=io.github.staffanberglund.transkribera
 Terminal=false
 Categories=AudioVideo;Audio;
 Keywords=audio;transcription;waveform;

@@ -5,9 +5,9 @@ set -euo pipefail
 repo_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 flatpak_app_dir="$repo_dir/build-dir"
 flatpak_repo_dir="$repo_dir/.flatpak-builder/cache"
-manifest="$repo_dir/flatpak/io.github.example.TranscriptionMvp.json"
+manifest="$repo_dir/flatpak/io.github.staffanberglund.transkribera.json"
 target_dir="$repo_dir/target/flatpak-dev"
-app_id="io.github.example.TranscriptionMvp"
+app_id="io.github.staffanberglund.transkribera"
 
 run_app=true
 if [[ "${1-}" == "--no-run" ]]; then
@@ -20,12 +20,14 @@ fi
 cd "$repo_dir"
 
 # Prepare a writable /app using the manifest's runtime and SDK. This is only
-# needed once (or after build-dir has been removed).
-if [[ ! -f "$flatpak_app_dir/metadata" ]]; then
+# needed once, after build-dir has been removed, or after the application ID
+# has changed.
+if [[ ! -f "$flatpak_app_dir/metadata" ]] \
+    || ! grep -Fqx "name=$app_id" "$flatpak_app_dir/metadata"; then
     flatpak-builder \
         --user \
         --force-clean \
-        --stop-at=transcription-mvp \
+        --stop-at=transkribera \
         "$flatpak_app_dir" \
         "$manifest"
 fi
@@ -44,13 +46,16 @@ export PATH=/usr/lib/sdk/rust-stable/bin:$PATH
 export CARGO_TARGET_DIR="$target_dir"
 cd "$repo_dir"
 cargo build --locked --offline
-install -Dm755 "$target_dir/debug/transcription-mvp" /app/bin/transcription-mvp
-strip /app/bin/transcription-mvp
-install -Dm644 data/io.github.example.TranscriptionMvp.desktop /app/share/applications/io.github.example.TranscriptionMvp.desktop
-install -Dm644 data/io.github.example.TranscriptionMvp.metainfo.xml /app/share/metainfo/io.github.example.TranscriptionMvp.metainfo.xml
-install -Dm644 data/icons/io.github.example.TranscriptionMvp.svg /app/share/icons/hicolor/scalable/apps/io.github.example.TranscriptionMvp.svg
+install -Dm755 "$target_dir/debug/transkribera" /app/bin/transkribera
+strip /app/bin/transkribera
+install -Dm644 data/io.github.staffanberglund.transkribera.desktop /app/share/applications/io.github.staffanberglund.transkribera.desktop
+install -Dm644 data/io.github.staffanberglund.transkribera.metainfo.xml /app/share/metainfo/io.github.staffanberglund.transkribera.metainfo.xml
+install -Dm644 data/icons/io.github.staffanberglund.transkribera.svg /app/share/icons/hicolor/scalable/apps/io.github.staffanberglund.transkribera.svg
 ' sh "$repo_dir" "$target_dir"
 
+if ! grep -Fqx 'command=transkribera' "$flatpak_app_dir/metadata"; then
+    flatpak-builder --finish-only "$flatpak_app_dir" "$manifest"
+fi
 flatpak build-export "$flatpak_repo_dir" "$flatpak_app_dir"
 if flatpak info --user "$app_id" >/dev/null 2>&1; then
     flatpak update --user --assumeyes "$app_id"
