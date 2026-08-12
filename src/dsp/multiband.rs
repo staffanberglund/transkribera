@@ -25,12 +25,13 @@ pub struct FiveBandTempoProcessorConfig {
 
 /// A full-rate five-band tempo processor.
 ///
-/// This first multiband stage deliberately requires identical analysis
-/// settings for all five vocoders. Persistent per-band queues and explicit
-/// length checks establish the alignment boundary needed by the later
-/// multiresolution implementation.
+/// Each band may use a different FFT size and analysis hop. Persistent output
+/// queues absorb the different block-production schedules: streaming emits
+/// only samples available from every band, while flush pads the shorter DSP
+/// tails with silence so all queued samples are drained.
 pub struct FiveBandTempoProcessor {
     sample_rate: u32,
+    channel_count: usize,
     filter_bank: FiveBandFilterBank,
     phase_vocoders: Vec<PhaseVocoder>,
     band_input: [Vec<f32>; BAND_COUNT],
@@ -42,14 +43,6 @@ pub struct FiveBandTempoProcessor {
 
 impl FiveBandTempoProcessor {
     pub fn new(config: FiveBandTempoProcessorConfig) -> Result<Self> {
-        if config
-            .band_analysis
-            .windows(2)
-            .any(|pair| pair[0] != pair[1])
-        {
-            bail!("this multiband stage requires identical analysis settings for all five bands");
-        }
-
         let filter_bank = FiveBandFilterBank::new(FiveBandFilterBankConfig {
             sample_rate: config.sample_rate,
             channel_count: config.channel_count,
@@ -78,6 +71,7 @@ impl FiveBandTempoProcessor {
 
         Ok(Self {
             sample_rate: config.sample_rate,
+            channel_count: config.channel_count,
             filter_bank,
             phase_vocoders,
             band_input: std::array::from_fn(|_| Vec::new()),
@@ -109,7 +103,7 @@ impl FiveBandTempoProcessor {
         }
         self.filter_bank.process(input, &mut self.band_input)?;
         self.process_band_input(false)?;
-        self.drain_aligned_output(output)?;
+        self.drain_aligned_output(output, false)?;
         self.has_pending_audio |= !input.is_empty();
         Ok(())
     }
@@ -123,7 +117,7 @@ impl FiveBandTempoProcessor {
         }
         self.filter_bank.flush(&mut self.band_input);
         self.process_band_input(true)?;
-        self.drain_aligned_output(output)?;
+        self.drain_aligned_output(output, true)?;
         self.has_pending_audio = false;
         Ok(())
     }
@@ -160,15 +154,23 @@ impl FiveBandTempoProcessor {
         Ok(())
     }
 
-    fn drain_aligned_output(&mut self, output: &mut Vec<f32>) -> Result<()> {
-        let sample_count = self.output_queues[0].len();
-        if self
-            .output_queues
-            .iter()
-            .any(|queue| queue.len() != sample_count)
-        {
+    fn drain_aligned_output(&mut self, output: &mut Vec<f32>, flushing: bool) -> Result<()> {
+        let sample_count = if flushing {
+            self.output_queues
+                .iter()
+                .map(VecDeque::len)
+                .max()
+                .unwrap_or(0)
+        } else {
+            self.output_queues
+                .iter()
+                .map(VecDeque::len)
+                .min()
+                .unwrap_or(0)
+        };
+        if !sample_count.is_multiple_of(self.channel_count) {
             let lengths = self.output_queues.each_ref().map(VecDeque::len);
-            bail!("multiband phase-vocoder output lengths diverged: {lengths:?}");
+            bail!("multiband output lost channel alignment: {lengths:?}");
         }
 
         output.reserve(sample_count);
@@ -180,6 +182,7 @@ impl FiveBandTempoProcessor {
                 .sum();
             output.push(sample);
         }
+        debug_assert!(!flushing || self.output_queues.iter().all(VecDeque::is_empty));
         Ok(())
     }
 }
@@ -319,9 +322,45 @@ mod tests {
     }
 
     #[test]
-    fn different_band_resolutions_are_rejected_for_now() {
-        let mut invalid = config(1, 1.0);
-        invalid.band_analysis[4].fft_size = FFT_SIZE * 2;
-        assert!(FiveBandTempoProcessor::new(invalid).is_err());
+    fn different_band_resolutions_remain_aligned_through_speed_changes() {
+        let mut heterogeneous = config(2, 1.0);
+        heterogeneous.band_analysis = [
+            BandAnalysisConfig {
+                fft_size: 512,
+                analysis_hop: 64,
+            },
+            BandAnalysisConfig {
+                fft_size: 256,
+                analysis_hop: 32,
+            },
+            BandAnalysisConfig {
+                fft_size: 128,
+                analysis_hop: 16,
+            },
+            BandAnalysisConfig {
+                fft_size: 64,
+                analysis_hop: 8,
+            },
+            BandAnalysisConfig {
+                fft_size: 32,
+                analysis_hop: 4,
+            },
+        ];
+        let mut processor = FiveBandTempoProcessor::new(heterogeneous).unwrap();
+        assert_eq!(processor.latency_frames(), 16 + 512 - 64);
+
+        let input = sine_wave(440.0, 1.0, 2);
+        let mut output = Vec::new();
+        for (index, chunk) in input.chunks(422).enumerate() {
+            processor
+                .set_playback_speed([0.5, 1.25, 0.75, 1.5][index % 4])
+                .unwrap();
+            processor.process(chunk, &mut output).unwrap();
+        }
+        processor.flush(&mut output).unwrap();
+
+        assert_eq!(output.len() % 2, 0);
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        assert!(processor.output_queues.iter().all(|queue| queue.is_empty()));
     }
 }

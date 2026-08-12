@@ -248,14 +248,16 @@ and downsampling are later stages.
 ### Experimental five-band tempo processor
 
 The opt-in multiband processor runs each full-rate filter-bank output through
-its own phase vocoder, checks that all five output queues contain the same
-number of interleaved samples, and only then sums them. Its reported latency is
-the FIR group delay plus the largest phase-vocoder latency. Speed changes,
-flush, and reset are forwarded to all five processors.
+its own phase vocoder. Persistent queues absorb the different block-production
+schedules: during streaming it sums samples available from every band, and at
+end-of-stream it drains the longest DSP tail while padding shorter tails with
+silence. Its reported latency is the FIR group delay plus the largest
+phase-vocoder latency. Speed changes, flush, and reset are forwarded to all
+five processors.
 
-This first integration intentionally requires identical FFT and hop settings
-for every band. To enable it for manual A/B testing at a 48 kHz input rate, use
-this `dsp.json` override:
+The bands may use different FFT and hop settings while they still run at the
+common input sample rate. For manual testing at a 48 kHz input rate, use this
+`dsp.json` override:
 
 ```json
 {
@@ -264,20 +266,19 @@ this `dsp.json` override:
   "filter_tap_count": 257,
   "crossover_hz": [150, 600, 2400, 7000],
   "phase_vocoders": [
-    { "fft_size": 2048, "analysis_hop": 512 },
-    { "fft_size": 2048, "analysis_hop": 512 },
-    { "fft_size": 2048, "analysis_hop": 512 },
-    { "fft_size": 2048, "analysis_hop": 512 },
-    { "fft_size": 2048, "analysis_hop": 512 }
+    { "fft_size": 8192, "analysis_hop": 1024 },
+    { "fft_size": 4096, "analysis_hop": 512 },
+    { "fft_size": 2048, "analysis_hop": 256 },
+    { "fft_size": 1024, "analysis_hop": 128 },
+    { "fft_size": 512,  "analysis_hop": 64 }
   ]
 }
 ```
 
 Remove `band_count`, the crossover/filter fields, and four of the processor
-entries to return to the single-band engine. The five-band implementation is a
-topology and alignment milestone, not the final multiresolution engine: all
-bands still run at the source sample rate and deliberately reject differing
-analysis settings.
+entries to return to the single-band engine. This is not yet the final
+multirate engine: all bands still run at the source sample rate, and per-band
+downsampling and reconstruction filters remain a later stage.
 
 ### GStreamer integration and time
 
