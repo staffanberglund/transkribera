@@ -14,22 +14,26 @@ playback features.
 - Changes playback tempo from 0.25× to 1.50× with an in-project phase vocoder
   while preserving pitch, with an explicit checkbox to bypass tempo processing
   and play decoded PCM directly.
-- Seeks with a slider, a click on the waveform, `J`/`L` for ±10 seconds, or
-  Left/Right for ±1 second.
+- Seeks with a slider, a click on the waveform, `J`/`L` for ±10 seconds,
+  Shift+Left/Right for ±5 seconds, or Left/Right for ±1 second.
 - Zooms the waveform continuously from 1× to 100×. Slider changes center the
   playhead during playback and otherwise center the playback anchor;
-  `Ctrl`+scroll preserves the time beneath the pointer.
+  `Ctrl`+scroll and touchpad pinch preserve the time beneath the pointer.
 - Pans a zoomed waveform using two-finger scrolling or the timeline scrollbar.
 - Remembers a playback anchor: `K` toggles at the current position, `Space`
   pauses or restarts from the anchor, and `P` always restarts from the anchor.
 - Adds named, clickable, and deletable timeline markers at the playhead, jumps
-  between them with `Alt`+Left/Right, and saves them automatically as JSON for
-  each audio file. Right-clicking a marker opens a Rename menu; its pen button
-  is a direct rename shortcut.
+  between them with `Alt`+Left/Right or Page Up/Down, and saves them
+  automatically as JSON for each audio file. Right-clicking a marker opens a
+  Rename menu; its pen button is a direct rename shortcut.
+- Creates persistent A–B loops by dragging across the waveform. Saved loops
+  appear beside markers; selecting one enables repetition, and its A and B
+  handles can be dragged independently for precise adjustment.
 - Collapses the marker list when it is not needed or resizes it by dragging the
   divider between the waveform controls and marker pane.
-- Offers a persistent setting to prompt for marker names or assign generic
-  names immediately.
+- Offers persistent settings for marker-name prompting and editable keyboard
+  shortcuts. Additional key combinations can be assigned to any supported
+  playback, seeking, or marker command.
 - Shows elapsed and total time and highlights waveform playback progress.
 - Decodes a normalized, reduced mono waveform on a worker thread.
 - Reports playback and waveform errors without terminating the application.
@@ -138,9 +142,12 @@ declared runtime. The application never relies on host-installed plugins.
 - `src/markers.rs` loads and atomically saves a versioned JSON marker list in
   the application's XDG data directory, keyed by the audio file's canonical
   path.
+- `src/loops.rs` loads and atomically saves named A–B regions per audio file.
 - `src/preferences.rs` persists the small application settings file alongside
   the marker directory.
 - `src/recent.rs` persists and updates the most-recent-first audio file list.
+- `src/shortcuts.rs` defines the editable command catalog, default key bindings,
+  and GTK accelerator matching used by the settings UI.
 - `src/waveform.rs` creates a separate `uridecodebin` pipeline ending in an
   `appsink`. A worker decodes mono 8 kHz float PCM, retains fixed-window peaks,
   retains peaks at roughly 8 ms intervals, reduces very long files to at most
@@ -337,8 +344,10 @@ Marker files are stored under
 location is normally
 `~/.var/app/io.github.staffanberglund.transkribera/data/transkribera/markers/`.
 Each JSON file records the source path plus marker names and positions in
-nanoseconds. Application settings are stored in `settings.json` one directory
-above the marker files, with recent paths in `recent.json` beside it.
+nanoseconds. Saved A–B regions use the parallel `loops/` directory and record
+their names and endpoints in nanoseconds. Application settings are stored in
+`settings.json` one directory above these directories, with recent paths in
+`recent.json` beside it.
 
 ## Known limitations
 
@@ -346,12 +355,11 @@ above the marker files, with recent paths in `recent.json` beside it.
 - Waveform peaks are optimized for navigation, not sample-accurate editing.
 - Duration and seeking depend on what the selected container/decoder reports.
 - Markers do not yet support notes or drag-to-reposition.
-- There are no playlists, loops, independent pitch controls, or editing tools.
+- There are no playlists, independent pitch controls, or destructive editing
+  tools.
 - The basic phase vocoder can smear sharp transients, sound phasy on complex
   material, and make the stereo image less stable because channels are
   processed independently. Artifacts are strongest near 0.25× and 1.50×.
-- Speed changes use time-based smoothing but do not yet share one central
-  source-to-output time map across multiple processors.
 - Only mono and stereo playback are negotiated through the phase vocoder.
 
 ## Manual tempo test procedure

@@ -156,6 +156,39 @@ pub fn unsigned_integer_array(json: &str, key: &str) -> Result<Vec<u64>> {
         .collect()
 }
 
+pub fn string(json: &str, key: &str) -> Result<String> {
+    let quoted_key = format!("\"{key}\"");
+    let value = json
+        .split_once(&quoted_key)
+        .and_then(|(_, rest)| rest.split_once(':'))
+        .map(|(_, value)| value.trim_start())
+        .with_context(|| format!("missing {key}"))?;
+    if !value.starts_with('"') {
+        bail!("{key} is not a JSON string");
+    }
+    let mut escaped = false;
+    let end = value[1..]
+        .char_indices()
+        .find_map(|(offset, character)| {
+            if escaped {
+                escaped = false;
+                None
+            } else if character == '\\' {
+                escaped = true;
+                None
+            } else if character == '"' {
+                Some(offset + 2)
+            } else {
+                None
+            }
+        })
+        .with_context(|| format!("unterminated {key} string"))?;
+    parse_strings(&value[..end])?
+        .into_iter()
+        .next()
+        .with_context(|| format!("{key} is not a JSON string"))
+}
+
 pub fn parse_strings(values: &str) -> Result<Vec<String>> {
     let mut characters = values.chars().peekable();
     let mut strings = Vec::new();
@@ -218,7 +251,7 @@ pub fn parse_strings(values: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        array, escape_string, object_array, optional_unsigned_integer, parse_strings,
+        array, escape_string, object_array, optional_unsigned_integer, parse_strings, string,
         unsigned_integer, unsigned_integer_array,
     };
 
@@ -245,5 +278,6 @@ mod tests {
         );
         assert_eq!(unsigned_integer(objects[0], "size").unwrap(), 2048);
         assert_eq!(unsigned_integer(objects[1], "size").unwrap(), 512);
+        assert_eq!(string(r#"{"name":"a\\b\"c"}"#, "name").unwrap(), "a\\b\"c");
     }
 }

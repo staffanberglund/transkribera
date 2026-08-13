@@ -1,10 +1,12 @@
 mod application;
 mod dsp;
 mod json;
+mod loops;
 mod markers;
 mod player;
 mod preferences;
 mod recent;
+mod shortcuts;
 mod waveform;
 
 use anyhow::Context;

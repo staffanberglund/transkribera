@@ -3,17 +3,24 @@ use std::{fs, path::PathBuf};
 use anyhow::{Context, Result, bail};
 use gtk::glib;
 
-const FORMAT_VERSION: u32 = 1;
+use crate::{
+    json,
+    shortcuts::{Command, KeyBinding, default_key_bindings},
+};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+const FORMAT_VERSION: u32 = 2;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Preferences {
     pub prompt_for_marker_name: bool,
+    pub key_bindings: Vec<KeyBinding>,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             prompt_for_marker_name: true,
+            key_bindings: default_key_bindings(),
         }
     }
 }
@@ -46,7 +53,7 @@ impl PreferencesStore {
             .with_context(|| format!("invalid settings file {}", self.path.display()))
     }
 
-    pub fn save(&self, preferences: Preferences) -> Result<()> {
+    pub fn save(&self, preferences: &Preferences) -> Result<()> {
         let Some(parent) = self.path.parent() else {
             bail!("settings file has no parent directory");
         };
@@ -61,10 +68,22 @@ impl PreferencesStore {
     }
 }
 
-fn serialize_preferences(preferences: Preferences) -> String {
+fn serialize_preferences(preferences: &Preferences) -> String {
+    let bindings = preferences
+        .key_bindings
+        .iter()
+        .map(|binding| {
+            format!(
+                "    {{\"command\": \"{}\", \"accelerator\": \"{}\"}}",
+                binding.command.id(),
+                json::escape_string(&binding.accelerator)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
     format!(
-        "{{\n  \"version\": {FORMAT_VERSION},\n  \"prompt_for_marker_name\": {}\n}}\n",
-        preferences.prompt_for_marker_name
+        "{{\n  \"version\": {FORMAT_VERSION},\n  \"prompt_for_marker_name\": {},\n  \"key_bindings\": [\n{bindings}\n  ]\n}}\n",
+        preferences.prompt_for_marker_name,
     )
 }
 
@@ -76,7 +95,7 @@ fn parse_preferences(json: &str) -> Result<Preferences> {
         .context("version is not an integer")?
         .parse::<u32>()
         .context("version is not an integer")?;
-    if version != FORMAT_VERSION {
+    if !matches!(version, 1 | FORMAT_VERSION) {
         bail!("unsupported settings version {version}");
     }
 
@@ -89,8 +108,26 @@ fn parse_preferences(json: &str) -> Result<Preferences> {
         "false" => false,
         _ => bail!("prompt_for_marker_name is not a boolean"),
     };
+    let key_bindings = if version == 1 {
+        default_key_bindings()
+    } else {
+        json::object_array(json, "key_bindings")?
+            .into_iter()
+            .map(|binding| {
+                let command_id = json::string(binding, "command")?;
+                let command = Command::from_id(&command_id)
+                    .with_context(|| format!("unknown shortcut command {command_id}"))?;
+                let accelerator = json::string(binding, "accelerator")?;
+                if accelerator.is_empty() {
+                    bail!("shortcut accelerator is empty");
+                }
+                Ok(KeyBinding::new(command, accelerator))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
     Ok(Preferences {
         prompt_for_marker_name,
+        key_bindings,
     })
 }
 
@@ -104,6 +141,8 @@ fn value_after_key<'a>(json: &'a str, key: &str) -> Result<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    use crate::shortcuts::default_key_bindings;
+
     use super::{Preferences, parse_preferences, serialize_preferences};
 
     #[test]
@@ -111,11 +150,20 @@ mod tests {
         for prompt_for_marker_name in [false, true] {
             let preferences = Preferences {
                 prompt_for_marker_name,
+                key_bindings: default_key_bindings(),
             };
             assert_eq!(
-                parse_preferences(&serialize_preferences(preferences)).unwrap(),
+                parse_preferences(&serialize_preferences(&preferences)).unwrap(),
                 preferences
             );
         }
+    }
+
+    #[test]
+    fn version_one_settings_receive_default_key_bindings() {
+        let preferences =
+            parse_preferences("{\"version\":1,\"prompt_for_marker_name\":false}").unwrap();
+        assert!(!preferences.prompt_for_marker_name);
+        assert_eq!(preferences.key_bindings, default_key_bindings());
     }
 }

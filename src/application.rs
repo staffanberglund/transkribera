@@ -8,10 +8,12 @@ use gstreamer as gst;
 use gtk::{cairo, gio, glib, prelude::*};
 
 use crate::{
+    loops::{LoopRegion, LoopStore},
     markers::{Marker, MarkerStore},
     player::{Player, PlayerEvent},
     preferences::{Preferences, PreferencesStore},
     recent::{RecentStore, record as record_recent},
+    shortcuts::{Command, KeyBinding, accelerator_for_event, default_key_bindings},
     waveform::WaveformJob,
 };
 
@@ -22,6 +24,8 @@ const MAX_WAVEFORM_ZOOM: f64 = 100.0;
 const ZOOM_OCTAVE_SCROLL_UNITS: f64 = 4.0;
 const PAN_FRACTION_PER_SCROLL_UNIT: f64 = 0.1;
 const MARKER_JUMP_TOLERANCE_NS: u64 = 50_000_000;
+const LOOP_HANDLE_HIT_RADIUS_PX: f64 = 8.0;
+const LOOP_DRAG_THRESHOLD_PX: f64 = 3.0;
 
 pub fn run() {
     let application = gtk::Application::builder().application_id(APP_ID).build();
@@ -38,6 +42,7 @@ struct UiState {
     end_button: gtk::Button,
     add_marker_button: gtk::Button,
     marker_list: gtk::ListBox,
+    loop_list: gtk::ListBox,
     recent_button: gtk::MenuButton,
     recent_menu: gio::Menu,
     settings_window: RefCell<Option<gtk::Window>>,
@@ -51,8 +56,14 @@ struct UiState {
     peaks: RefCell<Vec<f32>>,
     markers: RefCell<Vec<Marker>>,
     marker_store: RefCell<Option<MarkerStore>>,
+    loops: RefCell<Vec<LoopRegion>>,
+    loop_store: RefCell<Option<LoopStore>>,
+    active_loop: Cell<Option<usize>>,
+    loop_drag: RefCell<Option<LoopDrag>>,
+    loop_preview: Cell<Option<(u64, u64)>>,
     preferences_store: PreferencesStore,
     prompt_for_marker_name: Cell<bool>,
+    key_bindings: RefCell<Vec<KeyBinding>>,
     recent_store: RecentStore,
     recent_files: RefCell<Vec<PathBuf>>,
     progress: Cell<f64>,
@@ -66,6 +77,13 @@ struct UiState {
     user_seeking: Cell<bool>,
     seek_change_serial: Cell<u64>,
     waveform_job: RefCell<Option<WaveformJob>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoopDrag {
+    New { start_ns: u64 },
+    Start { index: usize },
+    End { index: usize },
 }
 
 fn build_ui(application: &gtk::Application) {
@@ -126,7 +144,7 @@ fn build_ui(application: &gtk::Application) {
         .vexpand(true)
         .build();
     waveform.set_tooltip_text(Some(
-        "Click to seek; two-finger scroll to pan; Ctrl+scroll to zoom",
+        "Click to seek; two-finger scroll to pan; pinch or Ctrl+scroll to zoom",
     ));
 
     let spinner = gtk::Spinner::new();
@@ -159,7 +177,7 @@ fn build_ui(application: &gtk::Application) {
     waveform_zoom.set_value_pos(gtk::PositionType::Right);
     waveform_zoom.set_hexpand(true);
     waveform_zoom.set_tooltip_text(Some(
-        "Waveform zoom level; Ctrl+scroll over the waveform to zoom",
+        "Waveform zoom level; pinch or Ctrl+scroll over the waveform to zoom",
     ));
     waveform_zoom.set_format_value_func(|_, value| format!("{value:.1}×"));
 
@@ -181,7 +199,7 @@ fn build_ui(application: &gtk::Application) {
 
     let play_button = gtk::Button::builder()
         .icon_name("media-playback-start-symbolic")
-        .tooltip_text("Play/Pause at current position (K)")
+        .tooltip_text("Play/Pause at current position")
         .sensitive(false)
         .build();
     let beginning_button = gtk::Button::builder()
@@ -267,6 +285,36 @@ fn build_ui(application: &gtk::Application) {
         .child(&marker_content)
         .build();
 
+    let loop_list = gtk::ListBox::new();
+    loop_list.set_selection_mode(gtk::SelectionMode::None);
+    loop_list.add_css_class("boxed-list");
+    let loop_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .min_content_height(64)
+        .vexpand(true)
+        .child(&loop_list)
+        .build();
+    let loop_help = gtk::Label::new(Some("Drag on the waveform to create a loop"));
+    loop_help.set_xalign(0.0);
+    loop_help.set_wrap(true);
+    loop_help.add_css_class("dim-label");
+    let loop_content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    loop_content.append(&loop_help);
+    loop_content.append(&loop_scroll);
+    let loop_expander = gtk::Expander::builder()
+        .label("Loops")
+        .expanded(true)
+        .hexpand(true)
+        .vexpand(true)
+        .child(&loop_content)
+        .build();
+
+    let annotation_boxes = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    annotation_boxes.set_homogeneous(true);
+    annotation_boxes.append(&marker_expander);
+    annotation_boxes.append(&loop_expander);
+
     let playback_content = gtk::Box::new(gtk::Orientation::Vertical, 12);
     playback_content.append(&waveform_frame);
     playback_content.append(&waveform_scrollbar);
@@ -284,7 +332,7 @@ fn build_ui(application: &gtk::Application) {
     split.set_shrink_end_child(false);
     split.set_position(315);
     split.set_start_child(Some(&playback_content));
-    split.set_end_child(Some(&marker_expander));
+    split.set_end_child(Some(&annotation_boxes));
     split.set_margin_top(12);
     split.set_margin_bottom(12);
     split.set_margin_start(12);
@@ -300,6 +348,7 @@ fn build_ui(application: &gtk::Application) {
         end_button,
         add_marker_button,
         marker_list,
+        loop_list,
         recent_button,
         recent_menu,
         settings_window: RefCell::new(None),
@@ -313,8 +362,14 @@ fn build_ui(application: &gtk::Application) {
         peaks: RefCell::new(Vec::new()),
         markers: RefCell::new(Vec::new()),
         marker_store: RefCell::new(None),
+        loops: RefCell::new(Vec::new()),
+        loop_store: RefCell::new(None),
+        active_loop: Cell::new(None),
+        loop_drag: RefCell::new(None),
+        loop_preview: Cell::new(None),
         preferences_store,
         prompt_for_marker_name: Cell::new(preferences.prompt_for_marker_name),
+        key_bindings: RefCell::new(preferences.key_bindings),
         recent_store,
         recent_files: RefCell::new(recent_files),
         progress: Cell::new(0.0),
@@ -342,6 +397,7 @@ fn build_ui(application: &gtk::Application) {
     connect_seeking(&state);
     connect_waveform_zoom(&state);
     connect_waveform_scroll_zoom(&state);
+    connect_waveform_pinch_zoom(&state);
     connect_keyboard_controls(&state);
     let timer_source = Rc::new(RefCell::new(Some(start_ui_timer(&state))));
     let close_timer_source = Rc::clone(&timer_source);
@@ -385,6 +441,7 @@ fn configure_waveform_drawing(state: &Rc<UiState>) {
             };
             let peaks = state.peaks.borrow();
             let markers = state.markers.borrow();
+            let loops = state.loops.borrow();
             draw_waveform(
                 context,
                 width as f64,
@@ -392,6 +449,9 @@ fn configure_waveform_drawing(state: &Rc<UiState>) {
                 WaveformView {
                     peaks: &peaks,
                     markers: &markers,
+                    loops: &loops,
+                    active_loop: state.active_loop.get(),
+                    loop_preview: state.loop_preview.get(),
                     duration_ns: state.duration.get().map(|duration| duration.nseconds()),
                     progress: state.progress.get(),
                     anchor_progress: state.anchor_progress.get(),
@@ -503,6 +563,52 @@ fn connect_waveform_scroll_zoom(state: &Rc<UiState>) {
         glib::Propagation::Stop
     });
     state.waveform.add_controller(scroll);
+}
+
+fn connect_waveform_pinch_zoom(state: &Rc<UiState>) {
+    let gesture = gtk::GestureZoom::new();
+    gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let starting_zoom = Rc::new(Cell::new(MIN_WAVEFORM_ZOOM));
+    let focus = Rc::new(Cell::new((0.5, 0.5)));
+
+    let weak = Rc::downgrade(state);
+    let begin_zoom = Rc::clone(&starting_zoom);
+    let begin_focus = Rc::clone(&focus);
+    gesture.connect_begin(move |gesture, _sequence| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        begin_zoom.set(state.waveform_zoom.value());
+        let width = state.waveform.width().max(1) as f64;
+        let focus_x = gesture
+            .bounding_box_center()
+            .map(|(x, _)| x / width)
+            .unwrap_or_else(|| state.waveform_pointer.get())
+            .clamp(0.0, 1.0);
+        let focus_time = timeline_fraction_at_x(
+            state.waveform_adjustment.value(),
+            state.waveform_adjustment.page_size(),
+            focus_x,
+            1.0,
+        );
+        begin_focus.set((focus_time.clamp(0.0, 1.0), focus_x));
+    });
+
+    let weak = Rc::downgrade(state);
+    gesture.connect_scale_changed(move |gesture, scale| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        let current = state.waveform_zoom.value();
+        let next = (starting_zoom.get() * scale).clamp(MIN_WAVEFORM_ZOOM, MAX_WAVEFORM_ZOOM);
+        if (next - current).abs() <= f64::EPSILON {
+            return;
+        }
+        state.pending_zoom_focus.set(Some(focus.get()));
+        state.waveform_zoom.set_value(next);
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    state.waveform.add_controller(gesture);
 }
 
 fn connect_open_button(state: &Rc<UiState>, open_button: &gtk::Button) {
@@ -625,8 +731,8 @@ fn connect_settings_button(state: &Rc<UiState>, settings_button: &gtk::Button) {
         let window = gtk::Window::builder()
             .title("Settings")
             .transient_for(&state.window)
-            .default_width(420)
-            .resizable(false)
+            .default_width(620)
+            .default_height(620)
             .build();
         let content = gtk::Box::new(gtk::Orientation::Vertical, 18);
         content.set_margin_top(18);
@@ -653,7 +759,70 @@ fn connect_settings_button(state: &Rc<UiState>, settings_button: &gtk::Button) {
         marker_row.append(&marker_text);
         marker_row.append(&prompt_switch);
         content.append(&marker_row);
+
+        content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        let shortcut_header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        let shortcut_text = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        shortcut_text.set_hexpand(true);
+        let shortcut_title = gtk::Label::new(Some("Keyboard shortcuts"));
+        shortcut_title.set_xalign(0.0);
+        shortcut_title.add_css_class("title-4");
+        let shortcut_description = gtk::Label::new(Some(
+            "Edit a shortcut or add another key combination for an application command.",
+        ));
+        shortcut_description.set_xalign(0.0);
+        shortcut_description.set_wrap(true);
+        shortcut_description.add_css_class("dim-label");
+        shortcut_text.append(&shortcut_title);
+        shortcut_text.append(&shortcut_description);
+        let add_shortcut = gtk::Button::with_label("Add shortcut");
+        add_shortcut.set_valign(gtk::Align::Center);
+        shortcut_header.append(&shortcut_text);
+        shortcut_header.append(&add_shortcut);
+        content.append(&shortcut_header);
+
+        let shortcut_list = gtk::ListBox::new();
+        shortcut_list.set_selection_mode(gtk::SelectionMode::None);
+        shortcut_list.add_css_class("boxed-list");
+        let shortcut_scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .min_content_height(280)
+            .vexpand(true)
+            .child(&shortcut_list)
+            .build();
+        content.append(&shortcut_scroll);
+
+        let reset_shortcuts = gtk::Button::with_label("Restore default shortcuts");
+        reset_shortcuts.set_halign(gtk::Align::Start);
+        content.append(&reset_shortcuts);
         window.set_child(Some(&content));
+
+        rebuild_shortcut_list(&state, &shortcut_list);
+
+        let weak = Rc::downgrade(&state);
+        let weak_list = shortcut_list.downgrade();
+        add_shortcut.connect_clicked(move |_| {
+            if let (Some(state), Some(list)) = (weak.upgrade(), weak_list.upgrade()) {
+                show_shortcut_editor(&state, &list, None);
+            }
+        });
+
+        let weak = Rc::downgrade(&state);
+        let weak_list = shortcut_list.downgrade();
+        let weak_window = window.downgrade();
+        reset_shortcuts.connect_clicked(move |_| {
+            let (Some(state), Some(list)) = (weak.upgrade(), weak_list.upgrade()) else {
+                return;
+            };
+            state.key_bindings.replace(default_key_bindings());
+            if let Err(error) = save_preferences(&state)
+                && let Some(window) = weak_window.upgrade()
+            {
+                show_error(&window, "Could not save settings", &error.to_string());
+            }
+            rebuild_shortcut_list(&state, &list);
+        });
 
         let weak = Rc::downgrade(&state);
         let weak_window = window.downgrade();
@@ -663,9 +832,8 @@ fn connect_settings_button(state: &Rc<UiState>, settings_button: &gtk::Button) {
             };
             let prompt_for_marker_name = switch.is_active();
             state.prompt_for_marker_name.set(prompt_for_marker_name);
-            if let Err(error) = state.preferences_store.save(Preferences {
-                prompt_for_marker_name,
-            }) && let Some(window) = weak_window.upgrade()
+            if let Err(error) = save_preferences(&state)
+                && let Some(window) = weak_window.upgrade()
             {
                 show_error(&window, "Could not save settings", &error.to_string());
             }
@@ -681,6 +849,209 @@ fn connect_settings_button(state: &Rc<UiState>, settings_button: &gtk::Button) {
         state.settings_window.replace(Some(window.clone()));
         window.present();
     });
+}
+
+fn save_preferences(state: &UiState) -> anyhow::Result<()> {
+    state.preferences_store.save(&Preferences {
+        prompt_for_marker_name: state.prompt_for_marker_name.get(),
+        key_bindings: state.key_bindings.borrow().clone(),
+    })
+}
+
+fn rebuild_shortcut_list(state: &Rc<UiState>, list: &gtk::ListBox) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+
+    for (index, binding) in state.key_bindings.borrow().iter().enumerate() {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        row.set_margin_top(6);
+        row.set_margin_bottom(6);
+        row.set_margin_start(9);
+        row.set_margin_end(9);
+        let command = gtk::Label::new(Some(binding.command.label()));
+        command.set_xalign(0.0);
+        command.set_hexpand(true);
+        let edit = gtk::Button::with_label(&binding.display_label());
+        edit.set_tooltip_text(Some("Change this keyboard shortcut"));
+        let delete = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Remove this keyboard shortcut")
+            .build();
+
+        let weak = Rc::downgrade(state);
+        let weak_list = list.downgrade();
+        edit.connect_clicked(move |_| {
+            if let (Some(state), Some(list)) = (weak.upgrade(), weak_list.upgrade()) {
+                show_shortcut_editor(&state, &list, Some(index));
+            }
+        });
+
+        let weak = Rc::downgrade(state);
+        let weak_list = list.downgrade();
+        delete.connect_clicked(move |_| {
+            let (Some(state), Some(list)) = (weak.upgrade(), weak_list.upgrade()) else {
+                return;
+            };
+            if index < state.key_bindings.borrow().len() {
+                state.key_bindings.borrow_mut().remove(index);
+                if let Err(error) = save_preferences(&state) {
+                    show_error(&state.window, "Could not save settings", &error.to_string());
+                }
+                rebuild_shortcut_list(&state, &list);
+            }
+        });
+
+        row.append(&command);
+        row.append(&edit);
+        row.append(&delete);
+        list.append(&row);
+    }
+}
+
+fn show_shortcut_editor(state: &Rc<UiState>, list: &gtk::ListBox, index: Option<usize>) {
+    let existing = index.and_then(|index| state.key_bindings.borrow().get(index).cloned());
+    let window = gtk::Window::builder()
+        .title(if existing.is_some() {
+            "Edit shortcut"
+        } else {
+            "Add shortcut"
+        })
+        .transient_for(&state.window)
+        .modal(true)
+        .default_width(440)
+        .resizable(false)
+        .build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+
+    let command_label = gtk::Label::new(Some("Command"));
+    command_label.set_xalign(0.0);
+    let command_labels = Command::ALL.map(Command::label);
+    let command_picker = gtk::DropDown::from_strings(&command_labels);
+    let selected_command = existing
+        .as_ref()
+        .map(|binding| binding.command)
+        .unwrap_or(Command::TogglePlayback);
+    let selected = Command::ALL
+        .iter()
+        .position(|command| *command == selected_command)
+        .unwrap_or(0) as u32;
+    command_picker.set_selected(selected);
+
+    let key_label = gtk::Label::new(Some("Keyboard shortcut"));
+    key_label.set_xalign(0.0);
+    let key_button = gtk::Button::with_label(
+        &existing
+            .as_ref()
+            .map(KeyBinding::display_label)
+            .unwrap_or_else(|| "Press a key combination".into()),
+    );
+    key_button.set_sensitive(false);
+    key_button.add_css_class("suggested-action");
+    let explanation = gtk::Label::new(Some(
+        "Press the desired key combination now. Modifier-only input is ignored.",
+    ));
+    explanation.set_xalign(0.0);
+    explanation.set_wrap(true);
+    explanation.add_css_class("dim-label");
+
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    let save = gtk::Button::with_label("Save");
+    save.add_css_class("suggested-action");
+    save.set_sensitive(existing.is_some());
+    buttons.append(&cancel);
+    buttons.append(&save);
+
+    content.append(&command_label);
+    content.append(&command_picker);
+    content.append(&key_label);
+    content.append(&key_button);
+    content.append(&explanation);
+    content.append(&buttons);
+    window.set_child(Some(&content));
+
+    let accelerator = Rc::new(RefCell::new(
+        existing.as_ref().map(|binding| binding.accelerator.clone()),
+    ));
+    let controller = gtk::EventControllerKey::new();
+    let captured = Rc::clone(&accelerator);
+    let captured_button = key_button.clone();
+    let captured_save = save.clone();
+    controller.connect_key_pressed(move |_controller, key, _keycode, modifiers| {
+        let Some(value) = accelerator_for_event(key, modifiers) else {
+            return glib::Propagation::Stop;
+        };
+        let label = gtk::accelerator_parse(&value)
+            .map(|(key, modifiers)| gtk::accelerator_get_label(key, modifiers).to_string())
+            .unwrap_or_else(|| value.clone());
+        captured.replace(Some(value));
+        captured_button.set_label(&label);
+        captured_save.set_sensitive(true);
+        glib::Propagation::Stop
+    });
+    window.add_controller(controller);
+
+    let weak_window = window.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(window) = weak_window.upgrade() {
+            window.close();
+        }
+    });
+
+    let weak = Rc::downgrade(state);
+    let weak_list = list.downgrade();
+    let weak_window = window.downgrade();
+    save.connect_clicked(move |_| {
+        let (Some(state), Some(list), Some(window), Some(accelerator)) = (
+            weak.upgrade(),
+            weak_list.upgrade(),
+            weak_window.upgrade(),
+            accelerator.borrow().clone(),
+        ) else {
+            return;
+        };
+        if state
+            .key_bindings
+            .borrow()
+            .iter()
+            .enumerate()
+            .any(|(candidate, binding)| {
+                candidate != index.unwrap_or(usize::MAX) && binding.accelerator == accelerator
+            })
+        {
+            show_error(
+                &window,
+                "Shortcut already in use",
+                "Choose a different key combination.",
+            );
+            return;
+        }
+        let command = Command::ALL
+            .get(command_picker.selected() as usize)
+            .copied()
+            .unwrap_or(Command::TogglePlayback);
+        let binding = KeyBinding::new(command, accelerator);
+        if let Some(index) = index {
+            if let Some(existing) = state.key_bindings.borrow_mut().get_mut(index) {
+                *existing = binding;
+            }
+        } else {
+            state.key_bindings.borrow_mut().push(binding);
+        }
+        if let Err(error) = save_preferences(&state) {
+            show_error(&window, "Could not save settings", &error.to_string());
+            return;
+        }
+        rebuild_shortcut_list(&state, &list);
+        window.close();
+    });
+    window.present();
 }
 
 fn connect_playback_controls(state: &Rc<UiState>) {
@@ -818,12 +1189,13 @@ fn connect_marker_controls(state: &Rc<UiState>) {
 fn current_marker_position(state: &UiState) -> Option<u64> {
     let duration = state.duration.get().or_else(|| state.player.duration())?;
     Some(
-        state
-            .player
-            .position()
-            .unwrap_or_else(|| state.playback_anchor.get())
-            .min(duration)
-            .nseconds(),
+        navigation_position(
+            state.playing.get(),
+            state.player.position(),
+            state.playback_anchor.get(),
+        )
+        .min(duration)
+        .nseconds(),
     )
 }
 
@@ -1037,6 +1409,114 @@ fn save_markers(state: &UiState) -> anyhow::Result<()> {
     store.save(&state.markers.borrow())
 }
 
+fn save_loops(state: &UiState) -> anyhow::Result<()> {
+    let store = state.loop_store.borrow();
+    let Some(store) = store.as_ref() else {
+        return Ok(());
+    };
+    store.save(&state.loops.borrow())
+}
+
+fn next_generic_loop_name(loops: &[LoopRegion]) -> String {
+    let mut index = 1;
+    loop {
+        let name = format!("Loop {index}");
+        if loops.iter().all(|region| region.name != name) {
+            return name;
+        }
+        index += 1;
+    }
+}
+
+fn add_loop(state: &Rc<UiState>, first_ns: u64, second_ns: u64) {
+    let name = next_generic_loop_name(&state.loops.borrow());
+    let Some(region) = LoopRegion::new(name, first_ns, second_ns) else {
+        return;
+    };
+    let index = state.loops.borrow().len();
+    state.loops.borrow_mut().push(region);
+    state.active_loop.set(Some(index));
+    loop_data_changed(state);
+}
+
+fn delete_loop(state: &Rc<UiState>, index: usize) {
+    if index >= state.loops.borrow().len() {
+        return;
+    }
+    state.loops.borrow_mut().remove(index);
+    state.active_loop.set(match state.active_loop.get() {
+        Some(active) if active == index => None,
+        Some(active) if active > index => Some(active - 1),
+        active => active,
+    });
+    loop_data_changed(state);
+}
+
+fn loop_data_changed(state: &Rc<UiState>) {
+    rebuild_loop_list(state);
+    state.waveform.queue_draw();
+    if let Err(error) = save_loops(state) {
+        show_error(&state.window, "Could not save loops", &error.to_string());
+    }
+}
+
+fn rebuild_loop_list(state: &Rc<UiState>) {
+    while let Some(child) = state.loop_list.first_child() {
+        state.loop_list.remove(&child);
+    }
+
+    for (index, region) in state.loops.borrow().iter().enumerate() {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let active = gtk::CheckButton::with_label(&format!(
+            "{} — {}–{}",
+            region.name,
+            format_marker_time(region.start_ns),
+            format_marker_time(region.end_ns)
+        ));
+        active.set_active(state.active_loop.get() == Some(index));
+        active.set_hexpand(true);
+        active.set_halign(gtk::Align::Fill);
+        active.set_tooltip_text(Some("Enable this loop and seek to its A point"));
+        let delete = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Delete loop")
+            .build();
+
+        let weak = Rc::downgrade(state);
+        active.connect_toggled(move |button| {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            if button.is_active() {
+                state.active_loop.set(Some(index));
+                let start_ns = state
+                    .loops
+                    .borrow()
+                    .get(index)
+                    .map(|region| region.start_ns);
+                if let Some(start_ns) = start_ns {
+                    seek_to_position(&state, gst::ClockTime::from_nseconds(start_ns));
+                }
+            } else if state.active_loop.get() == Some(index) {
+                state.active_loop.set(None);
+            }
+            rebuild_loop_list(&state);
+            state.waveform.queue_draw();
+        });
+
+        let weak = Rc::downgrade(state);
+        delete.connect_clicked(move |_| {
+            if let Some(state) = weak.upgrade() {
+                delete_loop(&state, index);
+            }
+        });
+
+        row.append(&active);
+        row.append(&delete);
+        state.loop_list.append(&row);
+    }
+}
+
 fn format_marker_time(position_ns: u64) -> String {
     let total_milliseconds = position_ns / 1_000_000;
     let milliseconds = total_milliseconds % 1_000;
@@ -1062,35 +1542,39 @@ fn connect_keyboard_controls(state: &Rc<UiState>) {
         let Some(state) = weak.upgrade() else {
             return glib::Propagation::Proceed;
         };
-        let reserved_modifiers = gtk::gdk::ModifierType::CONTROL_MASK
-            | gtk::gdk::ModifierType::SUPER_MASK
-            | gtk::gdk::ModifierType::META_MASK;
-        if modifiers.intersects(reserved_modifiers) {
+        let command = state
+            .key_bindings
+            .borrow()
+            .iter()
+            .find(|binding| binding.matches(key, modifiers))
+            .map(|binding| binding.command);
+        let Some(command) = command else {
             return glib::Propagation::Proceed;
-        }
-
-        if modifiers.contains(gtk::gdk::ModifierType::ALT_MASK) {
-            match key {
-                gtk::gdk::Key::Left => jump_to_marker(&state, MarkerDirection::Previous),
-                gtk::gdk::Key::Right => jump_to_marker(&state, MarkerDirection::Next),
-                _ => return glib::Propagation::Proceed,
-            }
-            return glib::Propagation::Stop;
-        }
-
-        match key {
-            gtk::gdk::Key::k | gtk::gdk::Key::K => toggle_current_playback(&state),
-            gtk::gdk::Key::space => play_from_anchor(&state, true),
-            gtk::gdk::Key::p | gtk::gdk::Key::P => play_from_anchor(&state, false),
-            gtk::gdk::Key::j | gtk::gdk::Key::J => seek_relative(&state, -10),
-            gtk::gdk::Key::l | gtk::gdk::Key::L => seek_relative(&state, 10),
-            gtk::gdk::Key::Left => seek_relative(&state, -1),
-            gtk::gdk::Key::Right => seek_relative(&state, 1),
-            _ => return glib::Propagation::Proceed,
-        }
+        };
+        execute_command(&state, command);
         glib::Propagation::Stop
     });
     state.window.add_controller(controller);
+}
+
+fn execute_command(state: &Rc<UiState>, command: Command) {
+    match command {
+        Command::TogglePlayback => toggle_current_playback(state),
+        Command::PlayPauseFromAnchor => play_from_anchor(state, true),
+        Command::PlayFromAnchor => play_from_anchor(state, false),
+        Command::Stop => state.stop_button.emit_clicked(),
+        Command::GoToBeginning => seek_to_position(state, gst::ClockTime::ZERO),
+        Command::GoToEnd => state.end_button.emit_clicked(),
+        Command::SeekBackward1 => seek_relative(state, -1),
+        Command::SeekForward1 => seek_relative(state, 1),
+        Command::SeekBackward5 => seek_relative(state, -5),
+        Command::SeekForward5 => seek_relative(state, 5),
+        Command::SeekBackward10 => seek_relative(state, -10),
+        Command::SeekForward10 => seek_relative(state, 10),
+        Command::PreviousMarker => jump_to_marker(state, MarkerDirection::Previous),
+        Command::NextMarker => jump_to_marker(state, MarkerDirection::Next),
+        Command::AddMarker => state.add_marker_button.emit_clicked(),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1104,11 +1588,12 @@ fn jump_to_marker(state: &Rc<UiState>, direction: MarkerDirection) {
         return;
     }
 
-    let current_ns = state
-        .player
-        .position()
-        .unwrap_or_else(|| state.playback_anchor.get())
-        .nseconds();
+    let current_ns = navigation_position(
+        state.playing.get(),
+        state.player.position(),
+        state.playback_anchor.get(),
+    )
+    .nseconds();
     let markers = state.markers.borrow();
     let Some(position_ns) = marker_jump_target(&markers, current_ns, direction) else {
         return;
@@ -1116,6 +1601,18 @@ fn jump_to_marker(state: &Rc<UiState>, direction: MarkerDirection) {
     drop(markers);
 
     seek_to_position(state, gst::ClockTime::from_nseconds(position_ns));
+}
+
+fn navigation_position(
+    playing: bool,
+    player_position: Option<gst::ClockTime>,
+    playback_anchor: gst::ClockTime,
+) -> gst::ClockTime {
+    if playing {
+        player_position.unwrap_or(playback_anchor)
+    } else {
+        playback_anchor
+    }
 }
 
 fn marker_jump_target(
@@ -1254,32 +1751,122 @@ fn connect_seeking(state: &Rc<UiState>) {
             glib::Propagation::Proceed
         });
 
-    let waveform_click = gtk::GestureClick::new();
+    let waveform_drag = gtk::GestureDrag::new();
+    waveform_drag.set_button(1);
     let weak = Rc::downgrade(state);
-    waveform_click.connect_pressed(move |_gesture, _, x, _| {
+    waveform_drag.connect_drag_begin(move |_gesture, x, _y| {
         let Some(state) = weak.upgrade() else {
             return;
         };
-        let width = state.waveform.width().max(1) as f64;
-        if let Some(duration) = state.player.duration() {
-            let fraction = timeline_fraction_at_x(
-                state.waveform_adjustment.value(),
-                state.waveform_adjustment.page_size(),
-                x,
-                width,
-            );
-            let position = gst::ClockTime::from_nseconds(
-                (duration.nseconds() as f64 * fraction).round() as u64,
-            );
-            if let Err(error) = state.player.seek(position) {
-                show_error(&state.window, "Could not seek", &error.to_string());
-            } else {
-                set_playback_anchor(&state, position, Some(duration));
-                update_position(&state, position, Some(duration));
-            }
+        let Some(duration) = state.duration.get().or_else(|| state.player.duration()) else {
+            return;
+        };
+        let position_ns = waveform_x_to_ns(&state, x, duration.nseconds());
+        let drag =
+            active_loop_handle_at_x(&state, x, duration.nseconds()).unwrap_or(LoopDrag::New {
+                start_ns: position_ns,
+            });
+        state.loop_drag.replace(Some(drag));
+        if matches!(drag, LoopDrag::New { .. }) {
+            state.loop_preview.set(Some((position_ns, position_ns)));
+            state.waveform.queue_draw();
         }
     });
-    state.waveform.add_controller(waveform_click);
+
+    let weak = Rc::downgrade(state);
+    waveform_drag.connect_drag_update(move |gesture, offset_x, _offset_y| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        let (Some(duration), Some((start_x, _))) = (
+            state.duration.get().or_else(|| state.player.duration()),
+            gesture.start_point(),
+        ) else {
+            return;
+        };
+        let position_ns = waveform_x_to_ns(&state, start_x + offset_x, duration.nseconds());
+        let Some(drag) = *state.loop_drag.borrow() else {
+            return;
+        };
+        match drag {
+            LoopDrag::New { start_ns } => {
+                state.loop_preview.set(Some((start_ns, position_ns)));
+            }
+            LoopDrag::Start { index } => {
+                if let Some(region) = state.loops.borrow_mut().get_mut(index) {
+                    region.start_ns = position_ns.min(region.end_ns.saturating_sub(1));
+                }
+            }
+            LoopDrag::End { index } => {
+                if let Some(region) = state.loops.borrow_mut().get_mut(index) {
+                    region.end_ns = position_ns.max(region.start_ns.saturating_add(1));
+                }
+            }
+        }
+        state.waveform.queue_draw();
+    });
+
+    let weak = Rc::downgrade(state);
+    waveform_drag.connect_drag_end(move |gesture, offset_x, _offset_y| {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        let drag = state.loop_drag.borrow_mut().take();
+        let preview = state.loop_preview.take();
+        let Some(duration) = state.duration.get().or_else(|| state.player.duration()) else {
+            return;
+        };
+        match drag {
+            Some(LoopDrag::New { start_ns }) if offset_x.abs() >= LOOP_DRAG_THRESHOLD_PX => {
+                let end_ns = preview.map(|(_, end_ns)| end_ns).unwrap_or(start_ns);
+                add_loop(&state, start_ns, end_ns);
+            }
+            Some(LoopDrag::New { .. }) => {
+                let x = gesture.start_point().map(|(x, _)| x).unwrap_or(0.0);
+                seek_to_position(
+                    &state,
+                    gst::ClockTime::from_nseconds(waveform_x_to_ns(&state, x, duration.nseconds())),
+                );
+            }
+            Some(LoopDrag::Start { .. } | LoopDrag::End { .. }) => {
+                loop_data_changed(&state);
+            }
+            None => {}
+        }
+        state.waveform.queue_draw();
+    });
+    state.waveform.add_controller(waveform_drag);
+}
+
+fn waveform_x_to_ns(state: &UiState, x: f64, duration_ns: u64) -> u64 {
+    let fraction = timeline_fraction_at_x(
+        state.waveform_adjustment.value(),
+        state.waveform_adjustment.page_size(),
+        x,
+        state.waveform.width().max(1) as f64,
+    );
+    (duration_ns as f64 * fraction).round() as u64
+}
+
+fn active_loop_handle_at_x(state: &UiState, x: f64, duration_ns: u64) -> Option<LoopDrag> {
+    let index = state.active_loop.get()?;
+    let loops = state.loops.borrow();
+    let region = loops.get(index)?;
+    let width = state.waveform.width().max(1) as f64;
+    let visible_start = state.waveform_adjustment.value();
+    let visible_span = state.waveform_adjustment.page_size();
+    let endpoint_x = |position_ns: u64| {
+        (position_ns as f64 / duration_ns as f64 - visible_start) / visible_span * width
+    };
+    let start_distance = (endpoint_x(region.start_ns) - x).abs();
+    let end_distance = (endpoint_x(region.end_ns) - x).abs();
+    if start_distance.min(end_distance) > LOOP_HANDLE_HIT_RADIUS_PX {
+        None
+    } else if start_distance <= end_distance {
+        Some(LoopDrag::Start { index })
+    } else {
+        Some(LoopDrag::End { index })
+    }
 }
 
 fn start_ui_timer(state: &Rc<UiState>) -> glib::SourceId {
@@ -1331,6 +1918,22 @@ fn open_file(state: &Rc<UiState>, path: &Path) {
             };
             state.marker_store.replace(Some(marker_store));
             rebuild_marker_list(state);
+
+            let loop_store = LoopStore::for_audio(path);
+            match loop_store.load() {
+                Ok(loops) => {
+                    state.loops.replace(loops);
+                }
+                Err(error) => {
+                    state.loops.borrow_mut().clear();
+                    show_error(&state.window, "Could not load loops", &error.to_string());
+                }
+            }
+            state.loop_store.replace(Some(loop_store));
+            state.active_loop.set(None);
+            state.loop_preview.set(None);
+            state.loop_drag.borrow_mut().take();
+            rebuild_loop_list(state);
             state.waveform.queue_draw();
             update_position(state, gst::ClockTime::ZERO, None);
 
@@ -1351,6 +1954,17 @@ fn open_file(state: &Rc<UiState>, path: &Path) {
 fn handle_player_event(state: &Rc<UiState>, event: PlayerEvent) {
     match event {
         PlayerEvent::EndOfStream => {
+            if let Some((start_ns, _end_ns)) = active_loop_bounds(state)
+                && let Err(error) = state
+                    .player
+                    .seek(gst::ClockTime::from_nseconds(start_ns))
+                    .and_then(|()| state.player.play())
+            {
+                show_error(&state.window, "Could not repeat loop", &error.to_string());
+            } else if active_loop_bounds(state).is_some() {
+                set_playing(state, true);
+                return;
+            }
             if let Err(error) = state.player.stop() {
                 log::warn!("could not reset after end of stream: {error:#}");
             }
@@ -1367,6 +1981,37 @@ fn handle_player_event(state: &Rc<UiState>, event: PlayerEvent) {
         }
         PlayerEvent::StateChanged(_) | PlayerEvent::DurationChanged => {}
     }
+}
+
+fn active_loop_bounds(state: &UiState) -> Option<(u64, u64)> {
+    let index = state.active_loop.get()?;
+    state
+        .loops
+        .borrow()
+        .get(index)
+        .map(|region| (region.start_ns, region.end_ns))
+}
+
+fn repeat_active_loop_if_needed(state: &Rc<UiState>, position: gst::ClockTime) -> bool {
+    let Some((start_ns, end_ns)) = active_loop_bounds(state) else {
+        return false;
+    };
+    let Some(start_ns) = loop_repeat_target(start_ns, end_ns, position.nseconds()) else {
+        return false;
+    };
+    let start = gst::ClockTime::from_nseconds(start_ns);
+    if let Err(error) = state.player.seek(start) {
+        show_error(&state.window, "Could not repeat loop", &error.to_string());
+        state.active_loop.set(None);
+        rebuild_loop_list(state);
+        return false;
+    }
+    update_position(state, start, state.player.duration());
+    true
+}
+
+fn loop_repeat_target(start_ns: u64, end_ns: u64, position_ns: u64) -> Option<u64> {
+    (start_ns < end_ns && position_ns >= end_ns).then_some(start_ns)
 }
 
 fn poll_waveform_job(state: &Rc<UiState>) {
@@ -1521,7 +2166,7 @@ fn set_playing(state: &Rc<UiState>, playing: bool) {
             .set_icon_name("media-playback-pause-symbolic");
         state
             .play_button
-            .set_tooltip_text(Some("Pause at current position (K)"));
+            .set_tooltip_text(Some("Pause at current position"));
 
         if state.playhead_tick.borrow().is_none() {
             let weak = Rc::downgrade(state);
@@ -1535,7 +2180,9 @@ fn set_playing(state: &Rc<UiState>, playing: bool) {
                         return glib::ControlFlow::Break;
                     }
 
-                    if let Some(position) = state.player.position() {
+                    if let Some(position) = state.player.position()
+                        && !repeat_active_loop_if_needed(&state, position)
+                    {
                         update_position(&state, position, state.player.duration());
                     }
                     glib::ControlFlow::Continue
@@ -1551,13 +2198,16 @@ fn set_playing(state: &Rc<UiState>, playing: bool) {
             .set_icon_name("media-playback-start-symbolic");
         state
             .play_button
-            .set_tooltip_text(Some("Play at current position (K)"));
+            .set_tooltip_text(Some("Play at current position"));
     }
 }
 
 struct WaveformView<'a> {
     peaks: &'a [f32],
     markers: &'a [Marker],
+    loops: &'a [LoopRegion],
+    active_loop: Option<usize>,
+    loop_preview: Option<(u64, u64)>,
     duration_ns: Option<u64>,
     progress: f64,
     anchor_progress: f64,
@@ -1579,6 +2229,35 @@ fn draw_waveform(context: &cairo::Context, width: f64, height: f64, view: Wavefo
     context.move_to(0.0, center.floor() + 0.5);
     context.line_to(width, center.floor() + 0.5);
     let _ = context.stroke();
+
+    if let Some(duration_ns) = view.duration_ns.filter(|duration| *duration > 0) {
+        for (index, region) in view.loops.iter().enumerate() {
+            draw_loop_region(
+                context,
+                width,
+                height,
+                duration_ns,
+                visible_start,
+                visible_span,
+                region.start_ns,
+                region.end_ns,
+                view.active_loop == Some(index),
+            );
+        }
+        if let Some((first_ns, second_ns)) = view.loop_preview {
+            draw_loop_region(
+                context,
+                width,
+                height,
+                duration_ns,
+                visible_start,
+                visible_span,
+                first_ns.min(second_ns),
+                first_ns.max(second_ns),
+                true,
+            );
+        }
+    }
 
     if !view.peaks.is_empty() {
         draw_peaks(
@@ -1637,6 +2316,53 @@ fn draw_waveform(context: &cairo::Context, width: f64, height: f64, view: Wavefo
         context.move_to(cursor_x, 0.0);
         context.line_to(cursor_x, height);
         let _ = context.stroke();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_loop_region(
+    context: &cairo::Context,
+    width: f64,
+    height: f64,
+    duration_ns: u64,
+    visible_start: f64,
+    visible_span: f64,
+    start_ns: u64,
+    end_ns: u64,
+    active: bool,
+) {
+    if start_ns >= end_ns {
+        return;
+    }
+    let start_fraction = start_ns as f64 / duration_ns as f64;
+    let end_fraction = end_ns as f64 / duration_ns as f64;
+    let start_x = (start_fraction - visible_start) / visible_span * width;
+    let end_x = (end_fraction - visible_start) / visible_span * width;
+    let left = start_x.clamp(0.0, width);
+    let right = end_x.clamp(0.0, width);
+    if right <= 0.0 || left >= width || right <= left {
+        return;
+    }
+    if active {
+        context.set_source_rgba(0.95, 0.45, 0.18, 0.22);
+    } else {
+        context.set_source_rgba(0.95, 0.45, 0.18, 0.10);
+    }
+    context.rectangle(left, 0.0, right - left, height);
+    let _ = context.fill();
+
+    context.set_source_rgba(1.0, 0.55, 0.20, if active { 0.95 } else { 0.55 });
+    context.set_line_width(if active { 2.5 } else { 1.0 });
+    for x in [start_x, end_x] {
+        if (0.0..=width).contains(&x) {
+            context.move_to(x, 0.0);
+            context.line_to(x, height);
+            let _ = context.stroke();
+            if active {
+                context.rectangle(x - 4.0, 0.0, 8.0, 12.0);
+                let _ = context.fill();
+            }
+        }
     }
 }
 
@@ -1733,9 +2459,12 @@ fn show_startup_error(application: &gtk::Application, details: &str) {
 
 #[cfg(test)]
 mod tests {
+    use gstreamer as gst;
+
     use super::{
-        Marker, MarkerDirection, escape_menu_label, marker_jump_target, next_generic_marker_name,
-        pan_viewport, timeline_fraction_at_x, zoom_after_scroll, zoomed_viewport,
+        Marker, MarkerDirection, escape_menu_label, loop_repeat_target, marker_jump_target,
+        navigation_position, next_generic_marker_name, pan_viewport, timeline_fraction_at_x,
+        zoom_after_scroll, zoomed_viewport,
     };
 
     fn assert_close(actual: f64, expected: f64) {
@@ -1803,6 +2532,28 @@ mod tests {
             marker_jump_target(&markers, 2_000_000_000, MarkerDirection::Next),
             Some(3_000_000_000)
         );
+    }
+
+    #[test]
+    fn paused_marker_navigation_uses_the_exact_playback_anchor() {
+        let stale_pipeline_position = gst::ClockTime::from_seconds(1);
+        let marker_anchor = gst::ClockTime::from_seconds(2);
+        assert_eq!(
+            navigation_position(false, Some(stale_pipeline_position), marker_anchor),
+            marker_anchor
+        );
+        assert_eq!(
+            navigation_position(true, Some(stale_pipeline_position), marker_anchor),
+            stale_pipeline_position
+        );
+    }
+
+    #[test]
+    fn loop_repeats_at_or_beyond_its_b_point() {
+        assert_eq!(loop_repeat_target(10, 20, 19), None);
+        assert_eq!(loop_repeat_target(10, 20, 20), Some(10));
+        assert_eq!(loop_repeat_target(10, 20, 25), Some(10));
+        assert_eq!(loop_repeat_target(20, 20, 20), None);
     }
 
     #[test]
