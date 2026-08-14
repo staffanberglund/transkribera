@@ -12,6 +12,8 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
+pub(crate) mod render;
+
 const SAMPLE_RATE: i32 = 8_000;
 const SAMPLES_PER_PEAK: usize = 64;
 const MAX_PEAKS: usize = 524_288;
