@@ -83,6 +83,7 @@ struct UiState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LoopDrag {
+    // A drag either creates a region or moves one handle of the active region.
     New { start_ns: u64 },
     Start { index: usize },
     End { index: usize },
@@ -580,6 +581,7 @@ fn connect_waveform_pinch_zoom(state: &Rc<UiState>) {
         let Some(state) = weak.upgrade() else {
             return;
         };
+        // GTK reports cumulative scale from gesture start, so retain the initial zoom.
         begin_zoom.set(state.waveform_zoom.value());
         let width = state.waveform.width().max(1) as f64;
         let focus_x = gesture
@@ -981,6 +983,7 @@ fn show_shortcut_editor(state: &Rc<UiState>, list: &gtk::ListBox, index: Option<
     let accelerator = Rc::new(RefCell::new(
         existing.as_ref().map(|binding| binding.accelerator.clone()),
     ));
+    // Capture the next complete key combination directly from this modal window.
     let controller = gtk::EventControllerKey::new();
     let captured = Rc::clone(&accelerator);
     let captured_button = key_button.clone();
@@ -1544,6 +1547,7 @@ fn connect_keyboard_controls(state: &Rc<UiState>) {
         let Some(state) = weak.upgrade() else {
             return glib::Propagation::Proceed;
         };
+        // Bindings are data-driven so settings changes take effect immediately.
         let command = state
             .key_bindings
             .borrow()
@@ -1753,6 +1757,7 @@ fn connect_seeking(state: &Rc<UiState>) {
             glib::Propagation::Proceed
         });
 
+    // A short drag is a seek click; a longer drag creates or adjusts a loop.
     let waveform_drag = gtk::GestureDrag::new();
     waveform_drag.set_button(1);
     let weak = Rc::downgrade(state);
@@ -1860,6 +1865,7 @@ fn active_loop_handle_at_x(state: &UiState, x: f64, duration_ns: u64) -> Option<
     let endpoint_x = |position_ns: u64| {
         (position_ns as f64 / duration_ns as f64 - visible_start) / visible_span * width
     };
+    // Hit-test in screen pixels so handles remain usable at every zoom level.
     let start_distance = (endpoint_x(region.start_ns) - x).abs();
     let end_distance = (endpoint_x(region.end_ns) - x).abs();
     if start_distance.min(end_distance) > LOOP_HANDLE_HIT_RADIUS_PX {
@@ -2001,6 +2007,7 @@ fn repeat_active_loop_if_needed(state: &Rc<UiState>, position: gst::ClockTime) -
     let Some(start_ns) = loop_repeat_target(start_ns, end_ns, position.nseconds()) else {
         return false;
     };
+    // Player positions are source-time values, so the same bounds work at any speed.
     let start = gst::ClockTime::from_nseconds(start_ns);
     if let Err(error) = state.player.seek(start) {
         show_error(&state.window, "Could not repeat loop", &error.to_string());

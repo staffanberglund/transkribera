@@ -16,6 +16,7 @@ pub struct LoopRegion {
 
 impl LoopRegion {
     pub fn new(name: String, first_ns: u64, second_ns: u64) -> Option<Self> {
+        // Dragging right-to-left creates the same normalized A–B region.
         let (start_ns, end_ns) = if first_ns <= second_ns {
             (first_ns, second_ns)
         } else {
@@ -36,6 +37,7 @@ pub struct LoopStore {
 
 impl LoopStore {
     pub fn for_audio(audio_path: &std::path::Path) -> Self {
+        // The canonical path gives each audio file a stable sidecar filename.
         let identity = audio_path
             .canonicalize()
             .unwrap_or_else(|_| audio_path.to_path_buf());
@@ -66,6 +68,7 @@ impl LoopStore {
         };
         fs::create_dir_all(parent)
             .with_context(|| format!("could not create loop directory {}", parent.display()))?;
+        // Replace through a temporary file so an interrupted write keeps the old data.
         let temporary = self.path.with_extension("json.tmp");
         fs::write(&temporary, serialize_loops(&self.audio_path, loops))
             .with_context(|| format!("could not write loop file {}", temporary.display()))?;
@@ -76,6 +79,7 @@ impl LoopStore {
 }
 
 fn stable_hash(bytes: &[u8]) -> u64 {
+    // FNV-1a is deterministic across runs, unlike Rust's default map hasher.
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in bytes {
         hash ^= u64::from(*byte);

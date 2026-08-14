@@ -20,6 +20,7 @@ pub enum Command {
 }
 
 impl Command {
+    // These IDs are persisted; renaming a display label must not change them.
     pub const ALL: [Self; 15] = [
         Self::TogglePlayback,
         Self::PlayPauseFromAnchor,
@@ -102,6 +103,7 @@ impl KeyBinding {
         else {
             return false;
         };
+        // Ignore Caps Lock and normalize letters before comparing accelerators.
         let mask = gtk::accelerator_get_default_mod_mask();
         binding_key == key.to_lower() && binding_modifiers == modifiers & mask
     }
@@ -135,6 +137,7 @@ pub fn default_key_bindings() -> Vec<KeyBinding> {
 }
 
 pub fn accelerator_for_event(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<String> {
+    // Wait for a real key instead of saving a modifier press by itself.
     if matches!(
         key,
         gdk::Key::Shift_L

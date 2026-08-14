@@ -108,6 +108,7 @@ fn parse_preferences(json: &str) -> Result<Preferences> {
         "false" => false,
         _ => bail!("prompt_for_marker_name is not a boolean"),
     };
+    // Version 1 predates editable shortcuts, so migrate it to today's defaults.
     let key_bindings = if version == 1 {
         default_key_bindings()
     } else {

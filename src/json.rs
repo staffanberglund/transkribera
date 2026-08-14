@@ -166,6 +166,7 @@ pub fn string(json: &str, key: &str) -> Result<String> {
     if !value.starts_with('"') {
         bail!("{key} is not a JSON string");
     }
+    // Isolate one quoted value so the parser does not consume the rest of its object.
     let mut escaped = false;
     let end = value[1..]
         .char_indices()
